@@ -4,18 +4,21 @@ from flask import Flask, request
 from openai import OpenAI
 from pinecone import Pinecone
 
-# ===== Env vars =====
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")               # esiste su Render
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")          # esiste su Render
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# ============== ENV VARS ==============
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")               # richiesto
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")          # richiesto
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # modello chat
 
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")      # esiste su Render
-PINECONE_HOST = os.environ.get("PINECONE_HOST")            # es. https://<index>.svc.<region>.pinecone.io
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")      # richiesto
+PINECONE_HOST = os.environ.get("PINECONE_HOST")            # richiesto: https://<index>.svc.<region>.pinecone.io
+
+# soglia minima per mostrare i risultati della ricerca (override con env SEARCH_SCORE_MIN)
+SCORE_MIN = float(os.environ.get("SEARCH_SCORE_MIN", "0.60"))
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# ===== Clients =====
+# ============== CLIENTS ==============
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 pc = None
@@ -24,15 +27,14 @@ if PINECONE_API_KEY and PINECONE_HOST:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     pindex = pc.Index(host=PINECONE_HOST)
 
-
-# ===== Utils =====
+# ============== UTILS ==============
 def embed_text(txt: str) -> list:
-    """Embedding 1536-dim con OpenAI text-embedding-3-small."""
+    """Embedding 1536-dim con OpenAI (serve billing attivo)."""
     resp = client.embeddings.create(model="text-embedding-3-small", input=[txt])
     return resp.data[0].embedding
 
 
-# ================== Handlers base ==================
+# ============== HANDLERS BASE ==============
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     bot.reply_to(message, "Ciao! Il bot 2Peak è attivo 🚀")
@@ -50,7 +52,7 @@ def help_cmd(message):
     )
 
 
-# ================== /bozza (OpenAI) ==================
+# ============== /bozza (OpenAI chat) ==============
 @bot.message_handler(commands=['bozza'])
 def bozza_cmd(message):
     brief = message.text.replace('/bozza', '', 1).strip()
@@ -79,10 +81,9 @@ def bozza_cmd(message):
         )
         text = (resp.choices[0].message.content or "").strip()
 
-        # Split in 3 varianti
+        # parsing semplice in 3 varianti
         lines = [l.strip() for l in text.split("\n") if l.strip()]
-        variants = []
-        current = []
+        variants, current = [], []
         for l in lines:
             if l[:2] in ("1.", "2.", "3.") or l[:2].isdigit() or l.startswith(("•", "- ")):
                 if current:
@@ -102,7 +103,7 @@ def bozza_cmd(message):
         bot.reply_to(message, f"Errore generazione: {e}")
 
 
-# ================== /ricorda (memorizza in Pinecone) ==================
+# ============== /ricorda (memorizza su Pinecone) ==============
 @bot.message_handler(commands=['ricorda'])
 def ricorda_cmd(message):
     if not pindex:
@@ -128,7 +129,7 @@ def ricorda_cmd(message):
         bot.reply_to(message, f"Errore memorizzazione: {e}")
 
 
-# ================== /cerca (query Pinecone, 3 risultati unici) ==================
+# ============== /cerca (dedup + soglia + fallback) ==============
 @bot.message_handler(commands=['cerca'])
 def cerca_cmd(message):
     if not pindex:
@@ -145,41 +146,53 @@ def cerca_cmd(message):
         qvec = embed_text(query)
         namespace = str(message.chat.id)
 
-        res = pindex.query(
-            vector=qvec, top_k=10, include_metadata=True, namespace=namespace
-        )
+        res = pindex.query(vector=qvec, top_k=20, include_metadata=True, namespace=namespace)
         matches = res.get("matches", []) if isinstance(res, dict) else res.matches
         if not matches:
             bot.reply_to(message, "Nessun risultato.")
             return
 
-        seen = set()
-        unique = []
+        def _score(m):
+            return m.get("score", 0.0) if isinstance(m, dict) else getattr(m, "score", 0.0)
+
+        # ordina per score e rimuovi duplicati testuali
+        matches = sorted(matches, key=_score, reverse=True)
+        seen, selected = set(), []
         for m in matches:
-            # compat dict/object
             text = (m["metadata"]["text"] if isinstance(m, dict)
                     else (m.metadata.get("text", "") if m.metadata else "")).strip()
             if not text or text in seen:
                 continue
-            seen.add(text)
-            score = (m.get("score", 0.0) if isinstance(m, dict)
-                     else getattr(m, "score", 0.0))
-            unique.append((text, score))
-            if len(unique) == 3:   # massimo 3 risultati unici
-                break
+            s = _score(m)
+            if s >= SCORE_MIN:
+                selected.append((text, s))
+                seen.add(text)
+                if len(selected) == 3:
+                    break
 
-        if not unique:
+        # fallback: se niente supera la soglia, mostra il migliore unico
+        if not selected:
+            for m in matches:
+                text = (m["metadata"]["text"] if isinstance(m, dict)
+                        else (m.metadata.get("text", "") if m.metadata else "")).strip()
+                if text:
+                    selected = [(text, _score(m))]
+                    break
+
+        if not selected:
             bot.reply_to(message, "Nessun risultato.")
             return
 
-        reply_lines = [f"• {t}\n  (score: {s:.3f})" for t, s in unique]
-        bot.reply_to(message, "\n\n".join(reply_lines))
+        reply = "\n\n".join(f"• {t}\n  (score: {s:.3f})" for t, s in selected)
+        if selected and selected[0][1] < SCORE_MIN:
+            reply += "\n\n_(nessun match ≥ soglia; mostrato il migliore disponibile)_"
+        bot.reply_to(message, reply)
 
     except Exception as e:
         bot.reply_to(message, f"Errore ricerca: {e}")
 
 
-# ================== /svuota (cancella namespace chat) ==================
+# ============== /svuota (pulisce namespace chat) ==============
 @bot.message_handler(commands=['svuota'])
 def svuota_cmd(message):
     if not pindex:
@@ -193,7 +206,7 @@ def svuota_cmd(message):
         bot.reply_to(message, f"Errore svuotamento: {e}")
 
 
-# ================== Webhook endpoints ==================
+# ============== WEBHOOK (Telegram) ==============
 @app.route(f"/{TOKEN}", methods=['POST'])
 def receive_update():
     update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
