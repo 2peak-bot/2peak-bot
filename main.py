@@ -1,125 +1,298 @@
 import os
-import telebot
-import requests
-from flask import Flask, request
-from openai import OpenAI
+import io
+import uuid
+import json
 import base64
+import numpy as np
+from PIL import Image
+import imageio.v3 as iio
+from flask import Flask, request
+import telebot
+from openai import OpenAI
+from pinecone import Pinecone
 
-# ==========================================
-# CONFIGURAZIONE
-# ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")       # inserisci il token Bot Telegram
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # inserisci la tua API key OpenAI
+# =========================
+# ENV & CLIENTS
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
+PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es. https://<index-id>.svc.<region>.pinecone.io
 
-bot = telebot.TeleBot(BOT_TOKEN)
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN mancante")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY mancante")
+if not PINECONE_API_KEY or not PINECONE_HOST:
+    raise ValueError("PINECONE_API_KEY o PINECONE_HOST mancanti")
+
+# soglia di match per /cerca (modificabile da ENV senza toccare il codice)
+SCORE_MIN = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))
+# modello embedding (dimensione 1536 per la tua index)
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+oai = OpenAI(api_key=OPENAI_API_KEY)
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(host=PINECONE_HOST)   # v5: ci si connette tramite host
 
-# ==========================================
-# FUNZIONI UTILI
-# ==========================================
+# memoria “fase” per chat (IT/EN)
+PHASE = {}  # {chat_id: "IT"|"EN"}
 
-def gen_image_png(prompt):
-    """Genera un'immagine PNG da un prompt"""
+
+# =========================
+# HELPER
+# =========================
+def _ns(message):
+    """Namespace = id chat (string) per isolare i dati di ogni chat."""
+    return str(message.chat.id)
+
+def embed_text(text: str) -> list:
+    """Restituisce il vettore embedding (list[float])."""
+    resp = oai.embeddings.create(model=EMBED_MODEL, input=text)
+    return resp.data[0].embedding
+
+def friendly_image_error(e: Exception) -> str:
+    s = str(e)
+    if "organization must be verified" in s or "verify" in s.lower():
+        return ("⚠️ Immagini bloccate: l'organizzazione OpenAI dev'essere verificata "
+                "(modello gpt-image-1). Dopo la verifica riprova.")
+    return f"⚠️ Errore generazione immagine: {s}"
+
+def gen_image_png(prompt: str) -> bytes:
+    """Genera PNG (bytes) con gpt-image-1; solleva eccezione in caso d’errore."""
+    result = oai.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
+    b64 = result.data[0].b64_json
+    return base64.b64decode(b64)
+
+def gen_glitch_gif(prompt: str, frames: int = 6, dur_ms: int = 140) -> bytes:
+    """
+    Crea una GIF animata 'glitch' generando più frame e unendoli.
+    Se qualcosa va storto, solleva eccezione.
+    """
+    imgs_np = []
+    for i in range(frames):
+        p = f"{prompt}. Glitch, chromatic aberration, scanlines, noise, frame {i+1}/{frames}"
+        r = oai.images.generate(model="gpt-image-1", prompt=p, size="512x512")
+        b = base64.b64decode(r.data[0].b64_json)
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        imgs_np.append(np.array(img))
+
+    out = io.BytesIO()
+    iio.imwrite(out, imgs_np, extension=".gif", fps=int(1000/dur_ms))
+    out.seek(0)
+    return out.read()
+
+def pinecone_upsert(namespace: str, text: str):
+    """Memorizza un testo in Pinecone con metadata {text}."""
+    vec = embed_text(text)
+    vector_id = str(uuid.uuid4())
+    index.upsert(
+        vectors=[{"id": vector_id, "values": vec, "metadata": {"text": text}}],
+        namespace=namespace,
+    )
+
+def pinecone_query(namespace: str, query: str, top_k: int = 3):
+    """Cerca in Pinecone, ritorna lista di (text, score)."""
+    vec = embed_text(query)
+    res = index.query(namespace=namespace, vector=vec, top_k=top_k, include_values=False, include_metadata=True)
+    items = []
+    for m in res.get("matches", []):
+        items.append((m["metadata"].get("text", ""), float(m.get("score", 0.0))))
+    return items
+
+def rag_text(namespace: str, user_prompt: str, phase: str) -> str:
+    """Crea testo con contesto recuperato da Pinecone (RAG)."""
+    results = pinecone_query(namespace, user_prompt, top_k=5)
+    context = "\n".join([f"- {t}" for t, _ in results]) if results else "(nessun contesto memorizzato)"
+    sys_it = (
+        "Sei un copywriter del progetto 2Peak. Tono minimal, ascetico, "
+        "potente. Frasi brevi. Evita cliché. Integra il contesto se utile."
+    )
+    sys_en = (
+        "You are a 2Peak copywriter. Minimal, ascetic, powerful tone. "
+        "Short lines. Avoid clichés. Weave in context when useful."
+    )
+    system = sys_it if phase == "IT" else sys_en
+
+    msg = oai.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Brief: {user_prompt}\n\nContext:\n{context}"},
+        ],
+    )
+    return msg.output_text
+
+
+# =========================
+# WEBHOOK (Opzione A auto-set)
+# =========================
+@app.route("/", methods=["GET"])
+def home():
+    """
+    Auto-set del webhook:
+    visita l’URL del servizio (Render) → il bot resetta e setta il webhook a /<TOKEN>.
+    """
+    base = request.url_root
+    if not base.endswith("/"):
+        base += "/"
+    bot.remove_webhook()
+    bot.set_webhook(url=base + TELEGRAM_BOT_TOKEN)
+    return "Webhook set! 2Peak Bot attivo 🚀", 200
+
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    update_json = request.get_data().decode("utf-8")
+    upd = telebot.types.Update.de_json(update_json)
     try:
-        result = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt,
-            size="512x512"
-        )
-        img_b64 = result.data[0].b64_json
-        return base64.b64decode(img_b64)
+        bot.process_new_updates([upd])
     except Exception as e:
-        return f"[Errore generazione immagine: {str(e)}]".encode()
+        print("Errore update:", e)
+    return "OK", 200
 
-def gen_gif_glitch(prompt):
-    """Genera una GIF animata glitch"""
-    try:
-        # Simuliamo output glitch con immagini sequenziali → GIF
-        result = client.images.generate(
-            model="gpt-image-1",
-            prompt=f"{prompt}, stile glitch, animazione frame",
-            size="512x512",
-            n=4
-        )
-        frames = [base64.b64decode(x.b64_json) for x in result.data]
-        # Qui potresti usare PIL.Image per unire frames in una GIF
-        return frames[0]  # per ora restituiamo solo il primo frame
-    except Exception as e:
-        return f"[Errore generazione GIF: {str(e)}]".encode()
 
-# ==========================================
-# COMANDI TELEGRAM
-# ==========================================
-
+# =========================
+# COMANDI
+# =========================
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    bot.reply_to(message, "👋 Benvenuto! Sono il bot 2Peak.\nUsa /memorizza o /cerca.")
+    PHASE[_ns(message)] = PHASE.get(_ns(message), "IT")
+    bot.reply_to(
+        message,
+        "👋 Benvenuto in 2Peak.\n"
+        "Comandi: /fase it|en · /ricorda <testo> · /cerca <query> · /svuota ·\n"
+        "/bozza <brief> · /gif <prompt> · /glitch <testo>\n"
+        "Il secondo picco non si spiega. Si scala."
+    )
 
-@bot.message_handler(commands=["memorizza"])
-def cmd_memorizza(message):
-    testo = message.text.replace("/memorizza", "").strip()
-    if not testo:
-        bot.reply_to(message, "❌ Devi scrivere qualcosa dopo /memorizza")
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    bot.reply_to(
+        message,
+        "📚 Aiuto:\n"
+        "/fase it|en – imposta lingua dello stile creativo\n"
+        "/ricorda <testo> – salva nel vettore\n"
+        "/cerca <query> – cerca tra ciò che hai memorizzato\n"
+        "/svuota – cancella memoria di questa chat\n"
+        "/bozza <brief> – bozza creativa con RAG (2Peak style)\n"
+        "/gif <prompt> – genera un’immagine tipo poster\n"
+        "/glitch <testo> – genera una GIF glitch animata"
+    )
+
+@bot.message_handler(commands=["fase"])
+def cmd_fase(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) == 1:
+        bot.reply_to(message, f"Fase corrente: {PHASE.get(_ns(message), 'IT')}")
+        return
+    val = args[1].strip().lower()
+    if val in ("it", "en"):
+        PHASE[_ns(message)] = val.upper()
+        bot.reply_to(message, f"Fase impostata: {val.upper()}")
     else:
-        # Placeholder per memoria su Pinecone
-        bot.reply_to(message, f"📝 Memorizzato: {testo}")
+        bot.reply_to(message, "Usa: /fase it oppure /fase en")
+
+@bot.message_handler(commands=["ricorda", "memorizza"])
+def cmd_ricorda(message):
+    text = message.text.split(" ", 1)
+    if len(text) < 2 or not text[1].strip():
+        bot.reply_to(message, "Scrivi qualcosa dopo /ricorda")
+        return
+    content = text[1].strip()
+    try:
+        pinecone_upsert(_ns(message), content)
+        bot.reply_to(message, "Memorizzato ✅")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore memorizzazione: {e}")
 
 @bot.message_handler(commands=["cerca"])
 def cmd_cerca(message):
-    query = message.text.replace("/cerca", "").strip()
-    if not query:
-        bot.reply_to(message, "❌ Devi scrivere qualcosa dopo /cerca")
-    else:
-        # Placeholder → query Pinecone
-        bot.reply_to(message, f"🔍 Risultato della ricerca per: {query}")
-
-@bot.message_handler(commands=["img"])
-def cmd_img(message):
-    prompt = message.text.replace("/img", "").strip()
-    if not prompt:
-        bot.reply_to(message, "❌ Devi scrivere un prompt dopo /img")
+    text = message.text.split(" ", 1)
+    if len(text) < 2 or not text[1].strip():
+        bot.reply_to(message, "Scrivi una query dopo /cerca")
         return
-    bot.reply_to(message, "🎨 Generazione immagine in corso...")
-    img_data = gen_image_png(prompt)
+    query = text[1].strip()
     try:
-        bot.send_photo(message.chat.id, img_data)
+        results = pinecone_query(_ns(message), query, top_k=3)
     except Exception as e:
-        bot.reply_to(message, f"Errore invio immagine: {e}")
+        bot.reply_to(message, f"⚠️ Errore ricerca: {e}")
+        return
+
+    if not results:
+        bot.reply_to(message, "Nessun risultato.")
+        return
+
+    # filtra per soglia, ma se nessuno supera la soglia mostra il migliore (comportamento visto prima)
+    above = [(t, s) for t, s in results if s >= SCORE_MIN]
+    show = above if above else results[:1]
+
+    lines = [f"• {t}\n(score: {s:.3f})" for t, s in show]
+    if not above:
+        lines.append("\n_(no match ≥ threshold; showing best available)_")
+    bot.reply_to(message, "\n\n".join(lines), parse_mode="Markdown")
+
+@bot.message_handler(commands=["svuota"])
+def cmd_svuota(message):
+    try:
+        index.delete(delete_all=True, namespace=_ns(message))
+        bot.reply_to(message, "Memoria di questa chat svuotata ✅")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore svuota: {e}")
+
+@bot.message_handler(commands=["bozza"])
+def cmd_bozza(message):
+    text = message.text.split(" ", 1)
+    if len(text) < 2 or not text[1].strip():
+        bot.reply_to(message, "Scrivi il brief dopo /bozza")
+        return
+    brief = text[1].strip()
+    phase = PHASE.get(_ns(message), "IT")
+    try:
+        out = rag_text(_ns(message), brief, phase)
+        # Telegram accetta max ~4096 char
+        bot.reply_to(message, out[:4000])
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore bozza: {e}")
 
 @bot.message_handler(commands=["gif"])
 def cmd_gif(message):
-    prompt = message.text.replace("/gif", "").strip()
-    if not prompt:
-        bot.reply_to(message, "❌ Devi scrivere un prompt dopo /gif")
+    text = message.text.split(" ", 1)
+    if len(text) < 2 or not text[1].strip():
+        bot.reply_to(message, "Prompt mancante. Usa: /gif <prompt>")
         return
-    bot.reply_to(message, "🎬 Generazione GIF/glitch in corso...")
-    img_data = gen_gif_glitch(prompt)
+    prompt = text[1].strip()
+    bot.send_chat_action(message.chat.id, "upload_photo")
     try:
-        bot.send_document(message.chat.id, ("glitch.gif", img_data))
+        png_bytes = gen_image_png(prompt + ". Stile manifesto 2Peak, minimal, high contrast, bold typography.")
+        bot.send_photo(message.chat.id, io.BytesIO(png_bytes))
+        bot.reply_to(message, "Immagine pronta.")
     except Exception as e:
-        bot.reply_to(message, f"Errore invio GIF: {e}")
+        bot.reply_to(message, friendly_image_error(e))
 
-# ==========================================
-# WEBHOOK FLASK
-# ==========================================
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    json_str = request.get_data().decode("UTF-8")
-    update = telebot.types.Update.de_json(json_str)
+@bot.message_handler(commands=["glitch"])
+def cmd_glitch(message):
+    text = message.text.split(" ", 1)
+    if len(text) < 2 or not text[1].strip():
+        bot.reply_to(message, "Testo mancante. Usa: /glitch <testo>")
+        return
+    prompt = text[1].strip()
+    bot.send_chat_action(message.chat.id, "upload_document")
     try:
-        bot.process_new_updates([update])
+        gif_bytes = gen_glitch_gif(prompt)
+        bot.send_document(message.chat.id, ("glitch.gif", io.BytesIO(gif_bytes)))
+        bot.reply_to(message, "Glitch pronto.")
     except Exception as e:
-        print(f"Errore update Telegram: {e}")
-    return "!", 200
+        bot.reply_to(message, friendly_image_error(e))
 
-@app.route("/")
-def index():
-    return "Bot 2Peak attivo 🚀", 200
 
-# ==========================================
+# =========================
 # AVVIO LOCALE
-# ==========================================
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # In locale: python main.py
+    # In produzione (Render): start command → gunicorn main:app
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
