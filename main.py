@@ -20,7 +20,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY) if (PINECONE_API_KEY and PINECONE_HOST) else None
 pindex = pc.Index(host=PINECONE_HOST) if pc else None
 
-# preferenza lingua runtime per chat (non persistente tra restart)
+# lingua runtime per chat (volatile)
 LANG_RUNTIME = {}
 
 # ========= UTILS =========
@@ -37,79 +37,74 @@ def pinecone_query(text: str, namespace: str, top_k: int = 10):
     return res.get("matches", []) if isinstance(res, dict) else res.matches
 
 def top_unique_matches(matches, k=3, score_min=SCORE_MIN):
-    def _score(m):
-        return m.get("score", 0.0) if isinstance(m, dict) else getattr(m, "score", 0.0)
+    def _score(m): return m.get("score", 0.0) if isinstance(m, dict) else getattr(m, "score", 0.0)
     def _text(m):
         return (m["metadata"]["text"] if isinstance(m, dict)
                 else (m.metadata.get("text", "") if getattr(m, "metadata", None) else "")).strip()
     matches = sorted(matches, key=_score, reverse=True)
     seen, out = set(), []
     for m in matches:
-        t = _text(m)
-        s = _score(m)
-        if not t or t in seen: 
-            continue
+        t, s = _text(m), _score(m)
+        if not t or t in seen: continue
         if s >= score_min:
-            out.append((t, s))
-            seen.add(t)
-            if len(out) == k: 
-                break
-    if not out:  # fallback: primo disponibile
+            out.append((t, s)); seen.add(t)
+            if len(out) == k: break
+    if not out:
         for m in matches:
             t = _text(m)
-            if t:
-                out = [(t, _score(m))]
-                break
+            if t: out = [(t, _score(m))]; break
     return out
 
 def save_temp_bytes(data: bytes, suffix: str) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        return tmp.name
+        tmp.write(data); return tmp.name
+
+def gen_image_png(prompt: str, size="1024x1024") -> bytes:
+    # gestione errori "pulita" (403/500 → RuntimeError con messaggio leggibile)
+    try:
+        r = client.images.generate(model="gpt-image-1", prompt=prompt, size=size, n=1)
+        return base64.b64decode(r.data[0].b64_json)
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
 
 # ========= HANDLERS =========
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     lang = current_lang(message.chat.id)
-    txt = "Ciao! Il bot 2Peak è attivo 🚀" if lang == "IT" else "Hi! 2Peak bot is live 🚀"
-    bot.reply_to(message, txt)
+    bot.reply_to(message, "Ciao! Il bot 2Peak è attivo 🚀" if lang=="IT" else "Hi! 2Peak bot is live 🚀")
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
     lang = current_lang(message.chat.id)
-    if lang == "IT":
-        txt = ("Comandi:\n"
-               "/start — verifica bot\n"
-               "/fase <it|en> — cambia lingua\n"
-               "/bozza <brief> — 3 varianti con RAG\n"
-               "/ricorda <testo> — memorizza\n"
-               "/cerca <query> — cerca nei ricordi\n"
-               "/svuota — cancella memoria chat\n"
-               "/esporta <txt|csv> — scarica memoria\n"
-               "/gif <prompt> — immagine stile GIF\n"
-               "/glitch <testo> — immagine glitch")
-    else:
-        txt = ("Commands:\n"
-               "/start — check bot\n"
-               "/fase <it|en> — switch language\n"
-               "/bozza <brief> — 3 variants with RAG\n"
-               "/ricorda <text> — remember\n"
-               "/cerca <query> — search memory\n"
-               "/svuota — clear chat memory\n"
-               "/esporta <txt|csv> — export memory\n"
-               "/gif <prompt> — GIF-like image\n"
-               "/glitch <text> — glitch image")
-    bot.reply_to(message, txt)
+    it = ("Comandi:\n"
+          "/start — verifica bot\n"
+          "/fase <it|en> — cambia lingua\n"
+          "/bozza <brief> — 3 varianti con RAG\n"
+          "/ricorda|/memorizza <testo> — memorizza\n"
+          "/cerca <query> — cerca nei ricordi\n"
+          "/svuota — cancella memoria chat\n"
+          "/esporta <txt|csv> — scarica memoria\n"
+          "/gif <prompt> — immagine stile GIF\n"
+          "/glitch <testo> — immagine glitch")
+    en = ("Commands:\n"
+          "/start — check bot\n"
+          "/fase <it|en> — switch language\n"
+          "/bozza <brief> — 3 variants with RAG\n"
+          "/ricorda|/memorizza <text> — remember\n"
+          "/cerca <query> — search memory\n"
+          "/svuota — clear chat memory\n"
+          "/esporta <txt|csv> — export memory\n"
+          "/gif <prompt> — GIF-like image\n"
+          "/glitch <text> — glitch image")
+    bot.reply_to(message, it if lang=="IT" else en)
 
 @bot.message_handler(commands=['fase'])
 def fase_cmd(message):
     args = message.text.split(maxsplit=1)
     if len(args) == 1:
-        cur = current_lang(message.chat.id)
-        bot.reply_to(message, f"Fase attuale: {cur}")
-        return
+        bot.reply_to(message, f"Fase attuale: {current_lang(message.chat.id)}"); return
     val = args[1].strip().lower()
-    if val in ("it", "en"):
+    if val in ("it","en"):
         LANG_RUNTIME[message.chat.id] = val.upper()
         bot.reply_to(message, f"Fase impostata: {val.upper()}")
     else:
@@ -119,27 +114,24 @@ def fase_cmd(message):
 @bot.message_handler(commands=['bozza'])
 def bozza_cmd(message):
     if not OPENAI_API_KEY:
-        bot.reply_to(message, "OpenAI non configurato.")
-        return
-    brief = message.text.replace('/bozza', '', 1).strip()
+        bot.reply_to(message, "OpenAI non configurato."); return
+    brief = message.text.replace('/bozza','',1).strip()
     if not brief:
         bot.reply_to(message, "Usa così:\n/bozza teaser sul secondo picco" if current_lang(message.chat.id)=="IT"
-                     else "Usage:\n/bozza teaser about second peak")
-        return
+                     else "Usage:\n/bozza teaser about second peak"); return
     lang = current_lang(message.chat.id)
     namespace = str(message.chat.id)
     context_chunks = []
     if pindex:
         matches = pinecone_query(brief, namespace, top_k=12)
-        ctx = top_unique_matches(matches, k=5)
-        context_chunks = [t for t, _ in ctx]
+        context_chunks = [t for t,_ in top_unique_matches(matches, k=5)]
 
     sys_it = ("Sei l’editor ufficiale di 2Peak. Tono: criptico, selettivo, anti-hype. "
-              "Usa frasi brevi e pause. Non spiegare mai il 'secondo picco'. "
-              "Se utile, incorpora sottilmente il contesto fornito, senza citarlo esplicitamente.")
+              "Frasi brevi, pause. Non spiegare mai il 'secondo picco'. "
+              "Intesse sottilmente il contesto senza citarlo.")
     sys_en = ("You are 2Peak’s in-house editor. Tone: cryptic, selective, anti-hype. "
               "Short lines, intentional pauses. Never explain the 'second peak'. "
-              "Subtly weave in the provided context without explicit citations.")
+              "Subtly weave in the context without explicit citations.")
     sys_prompt = sys_it if lang=="IT" else sys_en
 
     user_it = ("Obiettivo: {brief}\nContesto (se utile):\n{ctx}\n"
@@ -155,37 +147,32 @@ def bozza_cmd(message):
         bot.send_chat_action(message.chat.id, 'typing')
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"system","content":sys_prompt},
-                      {"role":"user","content":user_prompt}],
+            messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
             temperature=0.7,
         )
         text = (resp.choices[0].message.content or "").strip()
-        # parse 3 bullets
+        # parse 3 varianti
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         variants, current = [], []
         for l in lines:
-            if l[:2] in ("1.", "2.", "3.") or l[:2].isdigit() or l.startswith(("•","- ")):
+            if l[:2] in ("1.","2.","3.") or l[:2].isdigit() or l.startswith(("•","- ")):
                 if current: variants.append(" ".join(current).strip()); current=[]
-                l = l.lstrip("•-123). ").strip()
-                current.append(l)
+                l = l.lstrip("•-123). ").strip(); current.append(l)
             else:
                 current.append(l)
         if current: variants.append(" ".join(current).strip())
-        reply = "\n\n".join(f"• {v}" for v in variants[:3]) or ("Nessuna variante." if lang=="IT" else "No variants.")
-        bot.reply_to(message, reply)
+        bot.reply_to(message, "\n\n".join(f"• {v}" for v in variants[:3]) or ("Nessuna variante." if lang=="IT" else "No variants."))
     except Exception as e:
         bot.reply_to(message, f"Errore generazione: {e}")
 
-# ---- MEMORIA ----
-@bot.message_handler(commands=['ricorda'])
+# ---- MEMORIZZA / RICORDA ----
+@bot.message_handler(commands=['ricorda','memorizza'])
 def ricorda_cmd(message):
     if not pindex:
-        bot.reply_to(message, "Memoria non configurata.")
-        return
-    text = message.text.replace('/ricorda', '', 1).strip()
+        bot.reply_to(message, "Memoria non configurata."); return
+    text = message.text.split(' ',1)[1].strip() if ' ' in message.text else ""
     if not text:
-        bot.reply_to(message, "Usa così:\n/ricorda testo" if current_lang(message.chat.id)=="IT" else "Usage:\n/ricorda text")
-        return
+        bot.reply_to(message, "Usa così:\n/ricorda testo" if current_lang(message.chat.id)=="IT" else "Usage:\n/ricorda text"); return
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         vec = embed_text(text)
@@ -196,22 +183,19 @@ def ricorda_cmd(message):
     except Exception as e:
         bot.reply_to(message, f"Errore memorizzazione: {e}")
 
+# ---- CERCA ----
 @bot.message_handler(commands=['cerca'])
 def cerca_cmd(message):
     if not pindex:
-        bot.reply_to(message, "Memoria non configurata.")
-        return
-    query = message.text.replace('/cerca', '', 1).strip()
+        bot.reply_to(message, "Memoria non configurata."); return
+    query = message.text.split(' ',1)[1].strip() if ' ' in message.text else ""
     if not query:
-        bot.reply_to(message, "Usa così:\n/cerca query" if current_lang(message.chat.id)=="IT" else "Usage:\n/cerca query")
-        return
+        bot.reply_to(message, "Usa così:\n/cerca query" if current_lang(message.chat.id)=="IT" else "Usage:\n/cerca query"); return
     try:
         bot.send_chat_action(message.chat.id, 'typing')
-        matches = pinecone_query(query, str(message.chat.id), top_k=20)
-        selected = top_unique_matches(matches, k=3, score_min=SCORE_MIN)
+        selected = top_unique_matches(pinecone_query(query, str(message.chat.id), top_k=20), k=3, score_min=SCORE_MIN)
         if not selected:
-            bot.reply_to(message, "Nessun risultato." if current_lang(message.chat.id)=="IT" else "No results.")
-            return
+            bot.reply_to(message, "Nessun risultato." if current_lang(message.chat.id)=="IT" else "No results."); return
         reply = "\n\n".join(f"• {t}\n  (score: {s:.3f})" for t,s in selected)
         if selected and selected[0][1] < SCORE_MIN:
             reply += ("\n\n_(nessun match ≥ soglia; mostrato il migliore disponibile)_" 
@@ -221,28 +205,26 @@ def cerca_cmd(message):
     except Exception as e:
         bot.reply_to(message, f"Errore ricerca: {e}")
 
+# ---- SVUOTA ----
 @bot.message_handler(commands=['svuota'])
 def svuota_cmd(message):
     if not pindex:
-        bot.reply_to(message, "Memoria non configurata.")
-        return
+        bot.reply_to(message, "Memoria non configurata."); return
     try:
         pindex.delete(namespace=str(message.chat.id), delete_all=True)
         bot.reply_to(message, "Memoria di questa chat svuotata ✅" if current_lang(message.chat.id)=="IT" else "Chat memory cleared ✅")
     except Exception as e:
         bot.reply_to(message, f"Errore svuotamento: {e}")
 
+# ---- ESPORTA ----
 @bot.message_handler(commands=['esporta'])
 def esporta_cmd(message):
     if not pindex:
-        bot.reply_to(message, "Memoria non configurata.")
-        return
-    fmt = message.text.replace('/esporta', '', 1).strip().lower() or "txt"
+        bot.reply_to(message, "Memoria non configurata."); return
+    fmt = (message.text.split(' ',1)[1].strip().lower() if ' ' in message.text else "txt")
     if fmt not in ("txt","csv"):
-        bot.reply_to(message, "Usa: /esporta txt | /esporta csv")
-        return
+        bot.reply_to(message, "Usa: /esporta txt | /esporta csv"); return
     try:
-        # estrazione best-effort: query dummy per avere molti match
         matches = pindex.query(vector=[0]*1536, top_k=10000, include_metadata=True, namespace=str(message.chat.id))
         matches = matches.get("matches", []) if isinstance(matches, dict) else matches.matches
         rows = []
@@ -251,15 +233,12 @@ def esporta_cmd(message):
             t = (md.get("text","") if isinstance(md, dict) else md.get("text","")).strip()
             if t: rows.append(t)
         if not rows:
-            bot.reply_to(message, "Nessun dato.")
-            return
+            bot.reply_to(message, "Nessun dato."); return
         if fmt=="txt":
-            data = ("\n".join(rows)).encode("utf-8")
-            path = save_temp_bytes(data, ".txt")
+            path = save_temp_bytes(("\n".join(rows)).encode("utf-8"), ".txt")
         else:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                w = csv.writer(tmp)
-                w.writerow(["text"])
+                w = csv.writer(tmp); w.writerow(["text"])
                 for r in rows: w.writerow([r])
                 path = tmp.name
         with open(path, "rb") as f:
@@ -269,50 +248,51 @@ def esporta_cmd(message):
         bot.reply_to(message, f"Errore export: {e}")
 
 # ---- MEDIA (PNG immagini) ----
-def gen_image_png(prompt: str, size="1024x1024") -> bytes:
-    r = client.images.generate(model="gpt-image-1", prompt=prompt, size=size, n=1)
-    b64 = r.data[0].b64_json
-    return base64.b64decode(b64)
-
 @bot.message_handler(commands=['gif'])
 def gif_cmd(message):
     lang = current_lang(message.chat.id)
     prompt = message.text.replace('/gif','',1).strip()
     if not prompt:
-        bot.reply_to(message, "Scrivi: /gif <prompt>" if lang=="IT" else "Type: /gif <prompt>")
-        return
-    style = ("minimal, high-contrast, brand-consistent (2Peak), cinematic frame, subtle grain, no text overlays"
-             if lang=="EN" else
-             "minimale, alto contrasto, coerente con brand 2Peak, inquadratura cinematografica, grana leggera, senza scritte")
+        bot.reply_to(message, "Scrivi: /gif <prompt>" if lang=="IT" else "Type: /gif <prompt>"); return
+    style = ("minimale, alto contrasto, coerente brand 2Peak, inquadratura cinematografica, grana leggera, senza scritte"
+             if lang=="IT" else
+             "minimal, high-contrast, 2Peak brand-consistent, cinematic frame, subtle grain, no text overlays")
     try:
         bot.send_chat_action(message.chat.id, 'upload_photo')
         img = gen_image_png(f"{prompt}. {style}.")
         p = save_temp_bytes(img, ".png")
-        with open(p,"rb") as fh:
-            bot.send_photo(message.chat.id, fh, caption=("Immagine pronta." if lang=="IT" else "Image ready."))
+        with open(p,"rb") as fh: bot.send_photo(message.chat.id, fh, caption=("Immagine pronta." if lang=="IT" else "Image ready."))
         os.remove(p)
-    except Exception as e:
-        bot.reply_to(message, f"Errore generazione: {e}")
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "organization must be verified" in msg or "403" in msg:
+            bot.reply_to(message, ("⚠️ Immagini non abilitate: verifica l’organizzazione in OpenAI e riprova."
+                                   if lang=="IT" else "⚠️ Images not enabled: verify your OpenAI organization and try again."))
+        else:
+            bot.reply_to(message, f"Errore generazione: {e}")
 
 @bot.message_handler(commands=['glitch'])
 def glitch_cmd(message):
     lang = current_lang(message.chat.id)
     text = message.text.replace('/glitch','',1).strip()
     if not text:
-        bot.reply_to(message, "Scrivi: /glitch <testo>" if lang=="IT" else "Type: /glitch <text>")
-        return
-    prompt = (f"Glitch art of the phrase '{text}', cyberpunk, scanlines, chromatic aberration, neon, 2Peak aesthetic, no watermark"
-              if lang=="EN" else
-              f"Immagine glitch con la frase '{text}', cyberpunk, righe di scansione, aberrazione cromatica, neon, estetica 2Peak, senza watermark")
+        bot.reply_to(message, "Scrivi: /glitch <testo>" if lang=="IT" else "Type: /glitch <text>"); return
+    prompt = (f"Immagine glitch con la frase '{text}', cyberpunk, righe di scansione, aberrazione cromatica, neon, estetica 2Peak, senza watermark"
+              if lang=="IT" else
+              f"Glitch art of the phrase '{text}', cyberpunk, scanlines, chromatic aberration, neon, 2Peak aesthetic, no watermark")
     try:
         bot.send_chat_action(message.chat.id, 'upload_photo')
         img = gen_image_png(prompt)
         p = save_temp_bytes(img, ".png")
-        with open(p,"rb") as fh:
-            bot.send_photo(message.chat.id, fh, caption=("Glitch pronto." if lang=="IT" else "Glitch ready."))
+        with open(p,"rb") as fh: bot.send_photo(message.chat.id, fh, caption=("Glitch pronto." if lang=="IT" else "Glitch ready."))
         os.remove(p)
-    except Exception as e:
-        bot.reply_to(message, f"Errore generazione: {e}")
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "organization must be verified" in msg or "403" in msg:
+            bot.reply_to(message, ("⚠️ Immagini non abilitate: verifica l’organizzazione in OpenAI e riprova."
+                                   if lang=="IT" else "⚠️ Images not enabled: verify your OpenAI organization and try again."))
+        else:
+            bot.reply_to(message, f"Errore generazione: {e}")
 
 # ========= WEBHOOK =========
 @app.route(f"/{TOKEN}", methods=['POST'])
@@ -324,10 +304,8 @@ def receive_update():
 @app.route("/")
 def webhook():
     base_url = os.environ.get("RENDER_EXTERNAL_URL") or request.url_root
-    if not base_url.endswith("/"):
-        base_url += "/"
-    bot.remove_webhook()
-    bot.set_webhook(url=base_url + TOKEN)
+    if not base_url.endswith("/"): base_url += "/"
+    bot.remove_webhook(); bot.set_webhook(url=base_url + TOKEN)
     return "Webhook set!", 200
 
 if __name__ == "__main__":
