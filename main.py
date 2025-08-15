@@ -1,7 +1,7 @@
 # ==============================
-#  2Peak AI Bot — FULL PROVIDERS
+#  2Peak AI Bot — FULL PROVIDERS (Opzione C)
 #  Flask + TeleBot, OpenAI, Pinecone v5
-#  Media provider: FILEID (Telegram) | R2 (Cloudflare URLs)
+#  Media: R2 (URL) + FILEID Telegram, con auto-detection tipo
 # ==============================
 
 import os
@@ -30,10 +30,11 @@ PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es: https://<index-id>.svc.<r
 SEARCH_SCORE_MIN   = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dim
 
-# Media provider: "FILEID" (default) oppure "R2"
+# Provider media (mix): R2 preferito se settato, altrimenti FILEID
 MEDIA_PROVIDER     = (os.getenv("MEDIA_PROVIDER", "FILEID") or "FILEID").upper()
-# Base URL pubblico (opzionale) per i media su R2, es: https://pub-xxxx.r2.dev/2peak/
-R2_PUBLIC_BASEURL  = os.getenv("R2_PUBLIC_BASEURL", "").rstrip("/") + "/"
+R2_PUBLIC_BASEURL  = os.getenv("R2_PUBLIC_BASEURL", "").rstrip("/")
+if R2_PUBLIC_BASEURL:
+    R2_PUBLIC_BASEURL += "/"
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN mancante")
@@ -128,41 +129,43 @@ def p_query_text(ns: str, query: str, top_k: int = 3) -> List[tuple[str, float]]
             out.append((md.get("text", ""), float(m.get("score", 0.0))))
     return out
 
-# ---- GIF asset su Pinecone ----
-# FILEID: metadata {type:"gif_fileid", phase, key, file_id}
-# R2:     metadata {type:"gif_url",    phase, key, url}
-def p_upsert_gif_fileid(phase: str, key: str, file_id: str):
-    p_upsert("assets", embed_text(f"gif {phase} {key} fileid"), 
-             {"type": "gif_fileid", "phase": phase, "key": key, "file_id": file_id})
-def p_upsert_gif_url(phase: str, key: str, url: str):
-    p_upsert("assets", embed_text(f"gif {phase} {key} url"),
-             {"type": "gif_url", "phase": phase, "key": key, "url": url})
+# ---- Asset GIF/IMG su Pinecone ----
+# FILEID: metadata {type:"asset_fileid", phase, key, file_id, media_kind}
+# URL:    metadata {type:"asset_url",    phase, key, url,      media_kind}
+def p_upsert_fileid(phase: str, key: str, file_id: str, media_kind: str):
+    p_upsert("assets", embed_text(f"asset {phase} {key} {media_kind} fileid"), 
+             {"type": "asset_fileid", "phase": phase, "key": key, "file_id": file_id, "media_kind": media_kind})
 
-def p_get_gif_assets(phase: str, key: str) -> Dict[str, List[str]]:
-    """Ritorna {'file_ids': [...], 'urls': [...]} per (phase,key)."""
+def p_upsert_url(phase: str, key: str, url: str, media_kind: str):
+    p_upsert("assets", embed_text(f"asset {phase} {key} {media_kind} url"),
+             {"type": "asset_url", "phase": phase, "key": key, "url": url, "media_kind": media_kind})
+
+def p_get_assets(phase: str, key: str) -> Dict[str, List[Dict]]:
+    """Ritorna {'fileids': [{'file_id','media_kind'}], 'urls': [{'url','media_kind'}]}"""
     res = index.query(
         namespace="assets",
-        vector=embed_text(f"gif {phase} {key} any"),
-        top_k=20,
+        vector=embed_text(f"asset {phase} {key} any"),
+        top_k=30,
         include_metadata=True,
-        filter={"phase": {"$eq": phase}, "key": {"$eq": key}, "type": {"$in": ["gif_fileid","gif_url"]}},
+        filter={"phase": {"$eq": phase}, "key": {"$eq": key}, "type": {"$in": ["asset_fileid","asset_url"]}},
     )
-    out = {"file_ids": [], "urls": []}
+    out = {"fileids": [], "urls": []}
     for m in res.get("matches", []):
         md = m.get("metadata", {}) or {}
-        if md.get("type") == "gif_fileid" and md.get("file_id"):
-            out["file_ids"].append(md["file_id"])
-        elif md.get("type") == "gif_url" and md.get("url"):
-            out["urls"].append(md["url"])
+        if md.get("type") == "asset_fileid" and md.get("file_id"):
+            out["fileids"].append({"file_id": md["file_id"], "media_kind": md.get("media_kind", "animation")})
+        elif md.get("type") == "asset_url" and md.get("url"):
+            out["urls"].append({"url": md["url"], "media_kind": md.get("media_kind", "animation")})
     return out
 
-# ========= GLITCH (GIF animata) =========
+# ========= GLITCH (GIF animata generativa semplice) =========
 def gen_glitch_gif(prompt: str, frames: int = 6, dur_ms: int = 140) -> bytes:
     imgs_np = []
     for i in range(frames):
         p = f"{prompt}. Glitch, chromatic aberration, scanlines, noise, frame {i+1}/{frames}"
         b = gen_image_png(p, size="1024x1024")
         img = Image.open(io.BytesIO(b)).convert("RGB")
+        # micro-glitch: shift righe
         arr = np.array(img)
         if i % 2 == 0:
             arr[::4] = np.roll(arr[::4], 10, axis=1)
@@ -195,6 +198,72 @@ def telegram_webhook():
         return "OK", 200
     return abort(403)
 
+# ========= UTILS INVIO =========
+IMG_EXTS  = (".png", ".jpg", ".jpeg", ".webp")
+ANIM_EXTS = (".gif",)
+VID_EXTS  = (".mp4", ".mov", ".webm", ".mkv")
+
+def _send_url(chat_id: int, url: str, kind_hint: str = "", caption: str = "") -> bool:
+    u = url.lower()
+    try:
+        if kind_hint == "image" or u.endswith(IMG_EXTS):
+            bot.send_photo(chat_id, url, caption=caption or None)
+        elif kind_hint == "video" or u.endswith(VID_EXTS):
+            bot.send_video(chat_id, url, caption=caption or None)
+        else:  # default animation (gif)
+            bot.send_animation(chat_id, url, caption=caption or None)
+        return True
+    except Exception as e:
+        log.error("send_url ERROR: %r", e)
+        return False
+
+def _send_fileid(chat_id: int, file_id: str, kind: str = "", caption: str = "") -> bool:
+    try:
+        k = (kind or "").lower()
+        if k == "photo":
+            bot.send_photo(chat_id, file_id, caption=caption or None)
+        elif k == "video":
+            bot.send_video(chat_id, file_id, caption=caption or None)
+        elif k == "animation":
+            bot.send_animation(chat_id, file_id, caption=caption or None)
+        else:
+            # tentativi robusti
+            try:
+                bot.send_animation(chat_id, file_id, caption=caption or None)
+            except Exception:
+                try:
+                    bot.send_photo(chat_id, file_id, caption=caption or None)
+                except Exception:
+                    bot.send_document(chat_id, file_id, caption=caption or None)
+        return True
+    except Exception as e:
+        log.error("send_fileid ERROR: %r", e)
+        return False
+
+def _send_assets(chat_id: int, assets: Dict[str, List[Dict]], caption: str = ""):
+    # Priorità provider
+    if MEDIA_PROVIDER == "R2" and assets["urls"]:
+        sent = 0
+        for a in assets["urls"][:3]:
+            if _send_url(chat_id, a["url"], a.get("media_kind",""), caption if sent == 0 else ""):
+                sent += 1
+        if sent: return True
+    # fallback a FILEID
+    if assets["fileids"]:
+        sent = 0
+        for a in assets["fileids"][:3]:
+            if _send_fileid(chat_id, a["file_id"], a.get("media_kind",""), caption if sent == 0 else ""):
+                sent += 1
+        if sent: return True
+    # se niente, prova anche URL (se provider FILEID ma url registrati esistono)
+    if MEDIA_PROVIDER != "R2" and assets["urls"]:
+        sent = 0
+        for a in assets["urls"][:3]:
+            if _send_url(chat_id, a["url"], a.get("media_kind",""), caption if sent == 0 else ""):
+                sent += 1
+        if sent: return True
+    return False
+
 # ========= HANDLERS =========
 @bot.message_handler(commands=["start"])
 def cmd_start(m: telebot.types.Message):
@@ -203,7 +272,7 @@ def cmd_start(m: telebot.types.Message):
         m,
         "👋 Benvenuto in 2Peak.\n"
         "Comandi: /fase it|en · /ricorda <testo> · /cerca <query> · /svuota ·\n"
-        "/bozza <brief> · /gif [chiave] · /gifadd <chiave> (rispondendo a GIF/Video) · /gifaddurl <chiave> <url> · /glitch <testo>\n"
+        "/bozza <brief> · /gif [chiave] · /gifadd <chiave> (rispondendo a GIF/Video/Foto) · /gifaddurl <chiave> <url> · /glitch <testo>\n"
         "Il secondo picco non si spiega. Si scala."
     )
 
@@ -217,9 +286,9 @@ def cmd_help(m: telebot.types.Message):
         "/cerca <query> – cerca fra i ricordi\n"
         "/svuota – reset messaggi\n"
         "/bozza <brief> – bozza creativa 2Peak\n"
-        "/gif [chiave] – invia GIF dello slot o della chiave\n"
-        "/gifadd <chiave> – rispondi a una GIF/Video per registrarla (FILEID)\n"
-        "/gifaddurl <chiave> <url> – registra URL (R2)\n"
+        "/gif [chiave] – invia asset dello slot o della chiave\n"
+        "/gifadd <chiave> – rispondi a una GIF/Video/Foto per registrarla (FILEID)\n"
+        "/gifaddurl <chiave> <url> – registra URL (R2 o altro)\n"
         "/glitch <testo> – GIF glitch animata"
     )
 
@@ -291,49 +360,71 @@ def cmd_bozza(m: telebot.types.Message):
 # ====== MEDIA MANAGEMENT ======
 @bot.message_handler(commands=["gifadd"])
 def cmd_gifadd(m: telebot.types.Message):
-    """FILEID mode: rispondi a una GIF/Video con /gifadd <chiave>"""
+    """
+    FILEID mode: rispondi a una GIF/Video/Foto con /gifadd <chiave>
+    Riconosce: animation, video, photo, document immagine
+    """
     phase = get_phase(m.chat.id)
     args = m.text.split(maxsplit=1)
     if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Usa: rispondi a una GIF/Video con /gifadd <chiave>")
+        bot.reply_to(m, "Usa: rispondi a una GIF/Video/Foto con /gifadd <chiave>")
         return
     if not m.reply_to_message:
-        bot.reply_to(m, "Devi <b>rispondere</b> a una GIF/Video con questo comando.")
+        bot.reply_to(m, "Devi <b>rispondere</b> a un media con questo comando.")
         return
     key = args[1].strip().lower()
+
     reply = m.reply_to_message
     file_id = None
+    media_kind = None
     if reply.animation:
         file_id = reply.animation.file_id
+        media_kind = "animation"
     elif reply.video:
         file_id = reply.video.file_id
-    elif reply.document and str(reply.document.mime_type or "").startswith(("video/", "image/gif")):
+        media_kind = "video"
+    elif reply.photo:
+        # prendiamo la risoluzione più grande
+        p = sorted(reply.photo, key=lambda x: x.file_size or 0)[-1]
+        file_id = p.file_id
+        media_kind = "photo"
+    elif reply.document:
+        mt = (reply.document.mime_type or "").lower()
         file_id = reply.document.file_id
-    if not file_id:
-        bot.reply_to(m, "Messaggio non valido: rispondi a una GIF o a un Video.")
+        media_kind = "photo" if mt.startswith("image/") else "document"
+    else:
+        bot.reply_to(m, "Messaggio non valido: rispondi a GIF/Video/Foto/Documento immagine.")
         return
+
     try:
-        p_upsert_gif_fileid(phase, key, file_id)
-        bot.reply_to(m, f"✅ Registrato asset FILEID per <b>{key}</b> (fase {phase}).")
+        p_upsert_fileid(phase, key, file_id, media_kind)
+        bot.reply_to(m, f"✅ Registrato asset ({media_kind}) per <b>{key}</b> (fase {phase}).")
     except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore registrazione GIF: {e}")
+        bot.reply_to(m, f"⚠️ Errore registrazione asset: {e}")
 
 @bot.message_handler(commands=["gifaddurl"])
 def cmd_gifaddurl(m: telebot.types.Message):
-    """R2 mode: /gifaddurl <chiave> <url>  — aggiunge un URL (gif/mp4) alla chiave per la fase corrente."""
+    """R2 mode: /gifaddurl <chiave> <url|path>  — auto-detect immagine/animazione/video da estensione."""
     phase = get_phase(m.chat.id)
     args = m.text.split(maxsplit=2)
     if len(args) < 3 or not args[1].strip() or not args[2].strip():
-        bot.reply_to(m, "Usa: /gifaddurl <chiave> <url>")
+        bot.reply_to(m, "Usa: /gifaddurl <chiave> <url|path>")
         return
     key = args[1].strip().lower()
-    url = args[2].strip()
-    # Se hai messo R2_PUBLIC_BASEURL, puoi permettere di scrivere solo il filename:
-    if R2_PUBLIC_BASEURL and not url.startswith("http"):
-        url = R2_PUBLIC_BASEURL + url.lstrip("/")
+    raw = args[2].strip()
+    url = raw if raw.lower().startswith("http") else (R2_PUBLIC_BASEURL + raw.lstrip("/"))
+
+    ul = url.lower()
+    if ul.endswith(IMG_EXTS):
+        media_kind = "image"
+    elif ul.endswith(VID_EXTS):
+        media_kind = "video"
+    else:
+        media_kind = "animation"  # gif o altro
+
     try:
-        p_upsert_gif_url(phase, key, url)
-        bot.reply_to(m, f"✅ Registrato asset URL per <b>{key}</b> (fase {phase}).")
+        p_upsert_url(phase, key, url, media_kind)
+        bot.reply_to(m, f"✅ Registrato URL ({media_kind}) per <b>{key}</b> (fase {phase}).")
     except Exception as e:
         bot.reply_to(m, f"⚠️ Errore registrazione URL: {e}")
 
@@ -342,15 +433,13 @@ def cmd_gif(m: telebot.types.Message):
     """
     /gif               → invia lo slot timeline corrente (fase IT/EN)
     /gif <chiave>      → invia gli asset registrati per quella chiave (fase corrente)
-    Preferenza invio:
-      - Se MEDIA_PROVIDER=R2 e ci sono URL → invia URL
-      - Altrimenti, se esistono FILEID → invia file_id
-      - Altrimenti avvisa cosa manca
+    Auto‑detection:
+      - URL: .png/.jpg → photo, .gif → animation, .mp4/.mov → video
+      - FILEID: si usa il tipo salvato (photo/video/animation/document)
     """
     phase = get_phase(m.chat.id)
     args = m.text.split(maxsplit=1)
 
-    # Scelta chiave
     if len(args) == 1:
         key = current_slot(phase)
         if not key:
@@ -359,49 +448,10 @@ def cmd_gif(m: telebot.types.Message):
     else:
         key = args[1].strip().lower()
 
-    assets = p_get_gif_assets(phase, key)
-    urls = assets["urls"]
-    fids = assets["file_ids"]
-
-    # Ordine di preferenza
-    if MEDIA_PROVIDER == "R2" and urls:
-        _send_urls(m.chat.id, urls, caption=f"{key} · fase {phase}")
-        return
-    if fids:
-        _send_file_ids(m.chat.id, fids, caption=f"{key} · fase {phase}")
-        return
-    if urls:
-        _send_urls(m.chat.id, urls, caption=f"{key} · fase {phase}")
-        return
-
-    # Nessun asset
-    if MEDIA_PROVIDER == "R2":
-        hint = f"Usa /gifaddurl {key} <url>  (o carica FILEID rispondendo con /gifadd {key})"
-    else:
-        hint = f"Rispondi a una GIF/Video con /gifadd {key}  (oppure /gifaddurl {key} <url>)"
-    bot.reply_to(m, f"Nessun asset registrato per «{key}» (fase {phase}). {hint}")
-
-def _send_file_ids(chat_id: int, file_ids: List[str], caption: str = ""):
-    sent = 0
-    for fid in file_ids[:3]:
-        try:
-            bot.send_animation(chat_id, fid, caption=caption if sent == 0 else None)
-            sent += 1
-        except Exception as e:
-            log.error("send_animation FILEID ERROR: %r", e)
-    if sent == 0:
-        bot.send_message(chat_id, "⚠️ Non riesco a inviare questa GIF ora (FILEID).")
-
-def _send_urls(chat_id: int, urls: List[str], caption: str = ""):
-    sent = 0
-    for url in urls[:3]:
-        try:
-            bot.send_animation(chat_id, url, caption=caption if sent == 0 else None)
-            sent += 1
-        except Exception as e:
-            log.error("send_animation URL ERROR: %r", e)
-    if sent == 0:
-        bot.send_message(chat_id, "⚠️ Non riesco a inviare questa GIF ora (URL).")
+    assets = p_get_assets(phase, key)
+    if not _send_assets(m.chat.id, assets, caption=f"{key} · fase {phase}"):
+        hint = f"Usa /gifadd {key} (rispondendo a un media) o /gifaddurl {key} <url|path>"
+        bot.reply_to(m, f"Nessun asset disponibile per «{key}» (fase {phase}). {hint}")
 
 @bot.message_handler(commands=["glitch"])
 def cmd_glitch(m: telebot.types.Message):
@@ -421,6 +471,11 @@ def cmd_glitch(m: telebot.types.Message):
         bot.reply_to(m, f"⚠️ Errore glitch: {e}")
 
 # ================= RUN (LOCAL) =================
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
 if __name__ == "__main__":
+    # Avvio Flask (Render usa gunicorn main:app)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
