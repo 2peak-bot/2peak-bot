@@ -1,742 +1,468 @@
-# ==============================
-#  2Peak / 2Pick AI Bot — FULL STACK (Opzione C) + Step 2B
-#  Flask + TeleBot, OpenAI (chat/embeddings), Pinecone v5
-#  Media: R2 (URL) + Telegram FILEID, glitch locale, menu bottoni, test, batch
-#  NEW: /post, /caption, /keys (Timeline Assistant minimo)
-# ==============================
-
 import os
-import io
-import re
-import uuid
 import time
-import base64
+import json
 import logging
-from datetime import date
-from typing import List, Dict, Tuple, Optional
+from datetime import datetime
+from uuid import uuid4
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from flask import Flask, request, abort
 import telebot
-from telebot import types as t
+from telebot import types
+from flask import Flask, request
+
+# LLM & embeddings
 from openai import OpenAI
-from pinecone import Pinecone
 
-# ========= ENV =========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
-PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es: https://<index-id>.svc.<region>.pinecone.io
-SEARCH_SCORE_MIN   = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))
-EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim
+# Pinecone 5.x (opzionale ma supportato)
+try:
+    from pinecone import Pinecone
+    HAVE_PC = True
+except Exception:
+    HAVE_PC = False
 
-# Provider media (mix). Se R2 è configurato, preferisce URL; altrimenti FILEID
-MEDIA_PROVIDER     = (os.getenv("MEDIA_PROVIDER", "FILEID") or "FILEID").upper()
-R2_PUBLIC_BASEURL  = (os.getenv("R2_PUBLIC_BASEURL", "") or "").rstrip("/")
-if R2_PUBLIC_BASEURL:
-    R2_PUBLIC_BASEURL += "/"
+# Scheduler giornaliero
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN mancante")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY mancante")
-if not PINECONE_API_KEY or not PINECONE_HOST:
-    raise ValueError("PINECONE_API_KEY o PINECONE_HOST mancanti")
 
-# ========= LOG =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("2peak_bot")
+# ------------- Config di base -------------
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
-# ========= CLIENTS =========
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
+
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
+PINECONE_HOST = os.environ.get("PINECONE_HOST", "")  # es. "your-index-yourproject.svc.aped-xxx.pinecone.io"
+SCORE_MIN = float(os.environ.get("SEARCH_SCORE_MIN", "0.60"))
+
+# Timezone per lo scheduler
+TZ_NAME = os.environ.get("TZ", "Europe/Rome")
+tz = pytz.timezone(TZ_NAME)
+
+# URL base per il webhook (Render lo espone in RENDER_EXTERNAL_URL)
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE") or os.environ.get("RENDER_EXTERNAL_URL")
+AUTO_SET_WEBHOOK = os.environ.get("AUTO_SET_WEBHOOK", "true").lower() == "true"
+
+# GIF/asset – puoi sovrascrivere via ENV su Render
+GIF_MANIFESTO_URL = os.environ.get("GIF_MANIFESTO_URL", "")
+GIF_OLTRE_URL     = os.environ.get("GIF_OLTRE_URL", "")
+GIF_ONDA_URL      = os.environ.get("GIF_ONDA_URL", "")
+
+GLITCH_MANIFESTO_URL = os.environ.get("GLITCH_MANIFESTO_URL", GIF_MANIFESTO_URL)
+GLITCH_OLTRE_URL     = os.environ.get("GLITCH_OLTRE_URL", GIF_OLTRE_URL)
+GLITCH_ONDA_URL      = os.environ.get("GLITCH_ONDA_URL", GIF_ONDA_URL)
+
+# ------------- Client e oggetti globali -------------
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 app = Flask(__name__)
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
-oai = OpenAI(api_key=OPENAI_API_KEY)
-pc  = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(host=PINECONE_HOST)   # SDK v5 via host
+logging.basicConfig(level=logging.INFO)
 
-# ========= STATO LINGUA (per chat) =========
-PHASE: Dict[int, str] = {}  # {chat_id: "IT"/"EN"}
-def get_phase(chat_id: int) -> str:
-    return PHASE.get(chat_id, "IT")
+llm = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# ========= TIMELINE (slot per lingua) =========
-TIMELINE = {
-    "IT": [
-        {"from": "2025-08-10", "to": "2025-08-16", "slot": "manifesto"},
-        {"from": "2025-08-17", "to": "2025-08-24", "slot": "oltre_la_soglia"},
-        {"from": "2025-08-25", "to": "2025-09-02", "slot": "onda"},
-    ],
-    "EN": [
-        {"from": "2025-08-10", "to": "2025-08-16", "slot": "manifesto"},
-        {"from": "2025-08-17", "to": "2025-08-24", "slot": "beyond_the_threshold"},
-        {"from": "2025-08-25", "to": "2025-09-02", "slot": "wave"},
-    ],
-}
-def today_iso() -> str:
-    return date.today().isoformat()
-def current_slot(phase: str) -> Optional[str]:
-    ph = (phase or "IT").upper()
-    for win in TIMELINE.get(ph, []):
-        if win["from"] <= today_iso() <= win["to"]:
-            return win["slot"]
-    return None
-
-# ========= OPENAI HELPERS =========
-def embed_text(text: str) -> List[float]:
-    r = oai.embeddings.create(model=EMBED_MODEL, input=text)
-    return r.data[0].embedding
-
-def chat_gpt_brief(system: str, user_prompt: str) -> str:
+pc = None
+if HAVE_PC and PINECONE_API_KEY and PINECONE_HOST:
     try:
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.7,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(host=PINECONE_HOST)
     except Exception as e:
-        log.error("chat_gpt_brief ERROR: %r", e)
-        return "⚠️ Bozza non disponibile ora."
+        logging.error(f"Pinecone init error: {e}")
+        pc = None
+else:
+    index = None
 
-# ========= PINECONE HELPERS =========
-def p_upsert(ns: str, vec: List[float], metadata: Dict):
-    index.upsert(vectors=[{"id": str(uuid.uuid4()), "values": vec, "metadata": metadata}], namespace=ns)
+# Stato utente (fase + altro)
+user_state = {}  # chat_id -> {"fase": "IT"|"EN"}
 
-def p_upsert_text(ns: str, text: str):
-    p_upsert(ns, embed_text(text), {"type": "note", "text": text})
+# Scheduler
+scheduler = BackgroundScheduler(timezone=tz)
+scheduler.start()
+scheduled_jobs = {}   # chat_id -> job_id
+last_sent = {}        # chat_id -> last bot message_id
 
-def p_query_text(ns: str, query: str, top_k: int = 3) -> List[Tuple[str,float]]:
-    res = index.query(namespace=ns, vector=embed_text(query), top_k=top_k, include_metadata=True)
-    out = []
-    for m in res.get("matches", []):
-        md = m.get("metadata", {}) or {}
-        if md.get("type") == "note":
-            out.append((md.get("text", ""), float(m.get("score", 0.0))))
-    return out
 
-# ---- Asset GIF/IMG su Pinecone ----
-# FILEID: metadata {type:"asset_fileid", phase, key, file_id, media_kind}
-# URL:    metadata {type:"asset_url",    phase, key, url,      media_kind}
-def p_upsert_fileid(phase: str, key: str, file_id: str, media_kind: str):
-    p_upsert("assets",
-             embed_text(f"asset {phase} {key} {media_kind} fileid"),
-             {"type": "asset_fileid", "phase": phase, "key": key, "file_id": file_id, "media_kind": media_kind})
-
-def p_upsert_url(phase: str, key: str, url: str, media_kind: str):
-    p_upsert("assets",
-             embed_text(f"asset {phase} {key} {media_kind} url"),
-             {"type": "asset_url", "phase": phase, "key": key, "url": url, "media_kind": media_kind})
-
-def p_get_assets(phase: str, key: str) -> Dict[str, List[Dict]]:
-    """Ritorna {'fileids': [{'file_id','media_kind'}], 'urls': [{'url','media_kind'}]}"""
-    res = index.query(
-        namespace="assets",
-        vector=embed_text(f"asset {phase} {key} any"),
-        top_k=200,
-        include_metadata=True,
-        filter={"phase": {"$eq": phase}, "key": {"$eq": key}, "type": {"$in": ["asset_fileid","asset_url"]}},
-    )
-    out = {"fileids": [], "urls": []}
-    for m in res.get("matches", []):
-        md = m.get("metadata", {}) or {}
-        if md.get("type") == "asset_fileid" and md.get("file_id"):
-            out["fileids"].append({"file_id": md["file_id"], "media_kind": md.get("media_kind", "animation")})
-        elif md.get("type") == "asset_url" and md.get("url"):
-            out["urls"].append({"url": md["url"], "media_kind": md.get("media_kind", "animation")})
-    return out
-
-def p_list_keys(phase: str) -> List[str]:
-    """Lista chiavi disponibili per la fase (best-effort via query ampia)."""
-    res = index.query(
-        namespace="assets",
-        vector=embed_text(f"list assets {phase}"),
-        top_k=200,
-        include_metadata=True,
-        filter={"phase": {"$eq": phase}, "type": {"$in": ["asset_fileid","asset_url"]}},
-    )
-    keys = []
-    for m in res.get("matches", []):
-        md = m.get("metadata", {}) or {}
-        k = md.get("key")
-        if k and k not in keys:
-            keys.append(k)
-    return keys
-
-# ---- Captions su Pinecone ----
-# metadata {type:"caption", phase, key, text}
-def set_caption(phase: str, key: str, text: str):
-    p_upsert("captions", embed_text(f"caption {phase} {key} {text[:50]}"), {"type": "caption", "phase": phase, "key": key, "text": text})
-
-def get_caption(phase: str, key: str) -> Optional[str]:
-    res = index.query(
-        namespace="captions",
-        vector=embed_text(f"caption {phase} {key}"),
-        top_k=5,
-        include_metadata=True,
-        filter={"phase": {"$eq": phase}, "key": {"$eq": key}, "type": {"$eq": "caption"}},
-    )
-    for m in res.get("matches", []):
-        md = m.get("metadata", {}) or {}
-        txt = md.get("text")
-        if txt:
-            return txt
-    return None
-
-# ========= GLITCH LOCALE (GIF animata, no servizi esterni) =========
-def gen_glitch_gif_local(text: str, size: int = 512, frames: int = 12, fps: int = 10) -> bytes:
-    W = H = size
-    INDIGO = (16,22,55); BLUE = (28,40,120); WHITE = (245,247,255)
-    def grad():
-        base = Image.new("RGB", (W,H), INDIGO)
-        top  = Image.new("RGB", (W,H), BLUE)
-        mask = Image.linear_gradient("L").resize((W,H))
-        return Image.composite(top, base, mask)
-    def shift_rgb(img, dx=2):
-        arr = np.array(img)
-        r,g,b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
-        r = np.roll(r, dx, axis=1); b = np.roll(b, -dx, axis=1)
-        return Image.fromarray(np.stack([r,g,b], axis=2))
-    def scanlines(img, strength=28):
-        arr = np.array(img).astype(np.int16)
-        arr[::4,:,:] = np.clip(arr[::4,:,:] - strength, 0, 255)
-        return Image.fromarray(arr.astype(np.uint8))
-    def center_text(img, txt, fill=WHITE, sz=28):
-        d = ImageDraw.Draw(img)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sz)
-        except:
-            font = ImageFont.load_default()
-        bbox = d.textbbox((0,0), txt, font=font)
-        x = (img.width - (bbox[2]-bbox[0]))//2
-        y = (img.height - (bbox[3]-bbox[1]))//2
-        d.text((x,y), txt, font=font, fill=fill)
-        return img
-    frames_list = []
-    for i in range(frames):
-        bg = grad()
-        layer = center_text(bg.copy(), text, sz=28)
-        if i%3==0: layer = shift_rgb(layer, dx=3)
-        if i%4==0:
-            arr = np.array(layer)
-            arr[::8,:,:] = np.roll(arr[::8,:,:], 6, axis=1)
-            layer = Image.fromarray(arr)
-        frames_list.append(scanlines(layer, 26))
-    bio = io.BytesIO()
-    frames_list[0].save(bio, format="GIF", save_all=True, append_images=frames_list[1:], duration=int(1000/fps), loop=0, disposal=2)
-    bio.seek(0)
-    return bio.read()
-
-# ========= WEBHOOK (auto-set HTTPS) =========
-@app.route("/", methods=["GET"])
-def home():
-    base = request.url_root or ""
-    if not base.endswith("/"):
-        base += "/"
-    base = base.replace("http://", "https://")  # forza HTTPS per Telegram
-    try:
-        bot.remove_webhook()
-    except Exception:
-        pass
-    webhook_url = base + TELEGRAM_BOT_TOKEN
-    bot.set_webhook(url=webhook_url)
-    return f"Webhook set → {webhook_url}", 200
-
-@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    if request.headers.get("content-type") == "application/json":
-        update = telebot.types.Update.de_json(request.data.decode("utf-8"))
-        bot.process_new_updates([update])
-        return "OK", 200
-    return abort(403)
-
-# ========= INVIO MEDIA =========
-IMG_EXTS  = (".png",".jpg",".jpeg",".webp")
-ANIM_EXTS = (".gif",)
-VID_EXTS  = (".mp4",".mov",".webm",".mkv")
-
-def _send_url(chat_id: int, url: str, kind_hint: str = "", caption: str = "") -> bool:
-    u = url.lower()
-    try:
-        if kind_hint == "image" or u.endswith(IMG_EXTS):
-            bot.send_photo(chat_id, url, caption=caption or None)
-        elif kind_hint == "video" or u.endswith(VID_EXTS):
-            bot.send_video(chat_id, url, caption=caption or None)
-        else:
-            bot.send_animation(chat_id, url, caption=caption or None)
-        return True
-    except Exception as e:
-        log.error("send_url ERROR: %r", e)
-        return False
-
-def _send_fileid(chat_id: int, file_id: str, kind: str = "", caption: str = "") -> bool:
-    try:
-        k = (kind or "").lower()
-        if k == "photo":
-            bot.send_photo(chat_id, file_id, caption=caption or None)
-        elif k == "video":
-            bot.send_video(chat_id, file_id, caption=caption or None)
-        elif k == "animation":
-            bot.send_animation(chat_id, file_id, caption=caption or None)
-        else:
-            try:
-                bot.send_animation(chat_id, file_id, caption=caption or None)
-            except Exception:
-                try:
-                    bot.send_photo(chat_id, file_id, caption=caption or None)
-                except Exception:
-                    bot.send_document(chat_id, file_id, caption=caption or None)
-        return True
-    except Exception as e:
-        log.error("send_fileid ERROR: %r", e)
-        return False
-
-def _send_assets(chat_id: int, assets: Dict[str, List[Dict]], caption: str = ""):
-    # Preferenza al provider configurato
-    if MEDIA_PROVIDER == "R2" and assets["urls"]:
-        sent = 0
-        for a in assets["urls"][:3]:
-            if _send_url(chat_id, a["url"], a.get("media_kind",""), caption if sent == 0 else ""):
-                sent += 1
-        if sent: return True
-    # FILEID
-    if assets["fileids"]:
-        sent = 0
-        for a in assets["fileids"][:3]:
-            if _send_fileid(chat_id, a["file_id"], a.get("media_kind",""), caption if sent == 0 else ""):
-                sent += 1
-        if sent: return True
-    # fallback URL anche se provider non è R2
-    if MEDIA_PROVIDER != "R2" and assets["urls"]:
-        sent = 0
-        for a in assets["urls"][:3]:
-            if _send_url(chat_id, a["url"], a.get("media_kind",""), caption if sent == 0 else ""):
-                sent += 1
-        if sent: return True
-    return False
-
-# ========= MENÙ BOTTONI =========
-def make_menu(chat_id: int) -> t.InlineKeyboardMarkup:
-    kb = t.InlineKeyboardMarkup(row_width=3)
+# ------------- Helper UI -------------
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(
-        t.InlineKeyboardButton("🇮🇹 Fase IT", callback_data="phase:IT"),
-        t.InlineKeyboardButton("🇬🇧 Fase EN", callback_data="phase:EN"),
+        types.KeyboardButton("/fase IT"),
+        types.KeyboardButton("/fase EN"),
+        types.KeyboardButton("/bozza"),
     )
     kb.add(
-        t.InlineKeyboardButton("🎞 manifesto", callback_data="gif:manifesto"),
-        t.InlineKeyboardButton("⚡ oltre_la_soglia", callback_data="gif:oltre_la_soglia"),
-        t.InlineKeyboardButton("🌊 onda", callback_data="gif:onda"),
+        types.KeyboardButton("/ricorda"),
+        types.KeyboardButton("/cerca"),
+        types.KeyboardButton("/svuota"),
     )
     kb.add(
-        t.InlineKeyboardButton("🛰 beyond_the_threshold", callback_data="gif:beyond_the_threshold"),
-        t.InlineKeyboardButton("📶 glitch_signal", callback_data="gif:glitch_signal"),
-        t.InlineKeyboardButton("📣 Post slot", callback_data="post:slot"),
+        types.KeyboardButton("/post manifesto"),
+        types.KeyboardButton("/post oltre"),
+        types.KeyboardButton("/post onda"),
     )
-    kb.add(t.InlineKeyboardButton("🗂 Elenco keys", callback_data="list:keys"))
+    kb.add(
+        types.KeyboardButton("/schedule 09:00 manifesto"),
+        types.KeyboardButton("/pinlast"),
+    )
     return kb
 
-@bot.message_handler(commands=["menu"])
-def cmd_menu(m: telebot.types.Message):
-    bot.reply_to(m, f"Fase corrente: <b>{get_phase(m.chat.id)}</b>\nScegli un’azione:", reply_markup=make_menu(m.chat.id))
 
-@bot.callback_query_handler(func=lambda c: True)
-def on_callback(c: telebot.types.CallbackQuery):
-    try:
-        data = c.data or ""
-        chat_id = c.message.chat.id
-        if data.startswith("phase:"):
-            val = data.split(":",1)[1].upper()
-            if val in ("IT","EN"):
-                PHASE[chat_id] = val
-                bot.answer_callback_query(c.id, f"Fase → {val}")
-                bot.edit_message_text(f"Fase impostata: <b>{val}</b>", chat_id, c.message.message_id, parse_mode="HTML", reply_markup=make_menu(chat_id))
-            else:
-                bot.answer_callback_query(c.id, "Valore fase non valido.")
-        elif data.startswith("gif:"):
-            key = data.split(":",1)[1]
-            if key == "slot":
-                key = current_slot(get_phase(chat_id))
-                if not key:
-                    bot.answer_callback_query(c.id, "Nessuno slot attivo oggi.")
-                    return
-            assets = p_get_assets(get_phase(chat_id), key)
-            ok = _send_assets(chat_id, assets, caption=f"{key} · fase {get_phase(chat_id)}")
-            bot.answer_callback_query(c.id, "Inviato." if ok else "Nessun asset registrato.")
-        elif data == "post:slot":
-            k = current_slot(get_phase(chat_id))
-            if not k:
-                bot.answer_callback_query(c.id, "Nessuno slot oggi.")
-                return
-            _post_with_caption(chat_id, k)
-            bot.answer_callback_query(c.id, "Post inviato.")
-        elif data == "list:keys":
-            keys = p_list_keys(get_phase(chat_id))
-            txt = "Keys disponibili:\n" + (" • " + "\n • ".join(keys) if keys else " (nessuna)")
-            bot.answer_callback_query(c.id, "OK")
-            bot.send_message(chat_id, txt)
-        else:
-            bot.answer_callback_query(c.id, "Ignorato.")
-    except Exception as e:
-        log.error("callback ERROR: %r", e)
-        try:
-            bot.answer_callback_query(c.id, "Errore.")
-        except Exception:
-            pass
+def get_fase(chat_id: int) -> str:
+    return user_state.get(chat_id, {}).get("fase", "IT")
 
-# ========= HANDLERS BASE =========
-@bot.message_handler(commands=["start"])
-def cmd_start(m: telebot.types.Message):
-    PHASE[m.chat.id] = PHASE.get(m.chat.id, "IT")
+
+def set_fase(chat_id: int, fase: str):
+    user_state.setdefault(chat_id, {})["fase"] = fase.upper()
+
+
+def send_gif_with_caption(chat_id: int, url: str, caption: str):
+    """Invia una GIF con didascalia e ricorda l’ultimo messaggio per /pinlast."""
+    msg = bot.send_animation(chat_id=chat_id, animation=url, caption=caption)
+    last_sent[chat_id] = msg.message_id
+    return msg
+
+
+def embed_text(text: str):
+    if not llm:
+        raise RuntimeError("OPENAI_API_KEY mancante")
+    v = llm.embeddings.create(model=EMBED_MODEL, input=text)
+    return v.data[0].embedding
+
+
+# ------------- Comandi base -------------
+@bot.message_handler(commands=['start'])
+def cmd_start(message: types.Message):
+    chat_id = message.chat.id
+    set_fase(chat_id, get_fase(chat_id))  # default IT
     bot.reply_to(
-        m,
-        "👋 Benvenuto in 2Peak/2Pick.\n"
-        "Comandi: /fase it|en · /ricorda <testo> · /cerca <query> · /svuota ·\n"
-        "/bozza <brief> · /gif [chiave] · /gifadd (reply) · /gifaddurl <chiave> <url> · /glitch <testo>\n"
-        "/post [chiave] · /caption <chiave> <testo> · /keys · /test_it · /test_en · /batch <azioni> · /menu"
+        message,
+        "👋 Benvenuto in <b>2Peak</b>.\n"
+        "Comandi rapidi nel menu.\n\n"
+        "<b/Memoria</b>\n"
+        "• /ricorda <testo>\n"
+        "• /cerca <query>\n\n"
+        "<b>Media</b>\n"
+        "• /post <manifesto|oltre|onda>\n"
+        "• /schedule <HH:MM> <chiave>\n"
+        "• /unschedule\n"
+        "• /pinlast\n\n"
+        "<b>Fase</b>\n"
+        "• /fase IT  • /fase EN\n\n"
+        "Il secondo picco non si spiega. Si scala.",
+        reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=["help"])
-def cmd_help(m: telebot.types.Message):
-    bot.reply_to(
-        m,
-        "📚 Aiuto:\n"
-        "/fase it|en – imposta lingua\n"
-        "/ricorda <testo> – salva nel vettore\n"
-        "/cerca <query> – cerca fra i ricordi\n"
-        "/svuota – reset messaggi\n"
-        "/bozza <brief> – bozza creativa 2Peak\n"
-        "/gif [chiave] – invia asset registrati\n"
-        "/gifadd <chiave> – rispondi a una GIF/Video/Foto per registrarla (FILEID)\n"
-        "/gifaddurl <chiave> <url> – registra URL (R2 o altro)\n"
-        "/glitch <testo> – GIF glitch animata (locale)\n"
-        "/post [chiave] – invia asset + caption (se assente, genera)\n"
-        "/caption <chiave> <testo> – imposta caption personalizzata\n"
-        "/keys – elenca chiavi disponibili nella fase corrente\n"
-        "/test_it · /test_en – test rapidi\n"
-        "/batch – più comandi in un messaggio con ; o nuove linee\n"
-        "/menu – bottoni rapidi"
-    )
 
-@bot.message_handler(commands=["fase"])
-def cmd_fase(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1:
-        bot.reply_to(m, f"Fase corrente: <b>{get_phase(m.chat.id)}</b>")
+@bot.message_handler(commands=['fase'])
+def cmd_fase(message: types.Message):
+    chat_id = message.chat.id
+    parts = message.text.strip().split()
+    if len(parts) == 1:
+        bot.reply_to(message, "Usa: /fase IT oppure /fase EN")
         return
-    val = args[1].strip().upper()
-    if val not in ("IT","EN"):
-        bot.reply_to(m, "Usa: /fase IT oppure /fase EN")
+    fase = parts[1].upper()
+    if fase not in ("IT", "EN"):
+        bot.reply_to(message, "Valori ammessi: IT, EN")
         return
-    PHASE[m.chat.id] = val
-    bot.reply_to(m, f"Fase impostata: <b>{val}</b>")
+    set_fase(chat_id, fase)
+    bot.reply_to(message, f"Fase impostata: <b>{fase}</b>")
 
-@bot.message_handler(commands=["ricorda","memorizza"])
-def cmd_ricorda(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Usa: /ricorda <testo>")
+
+# ------------- Bozza (copy creativo) -------------
+@bot.message_handler(commands=['bozza'])
+def cmd_bozza(message: types.Message):
+    if not llm:
+        bot.reply_to(message, "OPENAI_API_KEY mancante.")
         return
+
+    parts = message.text.split(maxsplit=1)
+    prompt = parts[1] if len(parts) > 1 else "scrivi un tweet evocativo su 2Peak"
+    fase = get_fase(message.chat.id)
+    sys = "Sei un copywriter di 2Peak. Tono breve, evocativo, senza hashtag tranne #2Peak quando serve."
+    if fase == "EN":
+        sys = "You are 2Peak's copywriter. Short, evocative tone. No hashtags unless #2Peak fits."
+
     try:
-        p_upsert_text(str(m.chat.id), args[1].strip())
-        bot.reply_to(m, "Memorizzato ✅")
+        resp = llm.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+            max_tokens=120
+        )
+        text = resp.choices[0].message.content.strip()
+        bot.reply_to(message, text)
     except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore memorizzazione: {e}")
+        bot.reply_to(message, f"⚠️ Errore generazione: {e}")
 
-@bot.message_handler(commands=["cerca"])
-def cmd_cerca(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Usa: /cerca <query>")
-        return
-    try:
-        results = p_query_text(str(m.chat.id), args[1].strip(), top_k=3)
-    except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore ricerca: {e}")
-        return
-    if not results:
-        bot.reply_to(m, "Nessun risultato.")
-        return
-    above = [(t,s) for (t,s) in results if s >= SEARCH_SCORE_MIN]
-    show  = above if above else results[:1]
-    lines = [f"• {t}\n(score: {s:.3f})" for t,s in show]
-    if not above:
-        lines.append("\n<i>(no match ≥ soglia; mostro il migliore disponibile)</i>")
-    bot.reply_to(m, "\n\n".join(lines))
 
-@bot.message_handler(commands=["svuota"])
-def cmd_svuota(m: telebot.types.Message):
-    bot.reply_to(m, "Memoria di questa chat svuotata ✅")
+# ------------- Memoria (Pinecone) -------------
+def pinecone_ready():
+    return (pc is not None) and (index is not None) and bool(PINECONE_HOST)
 
-@bot.message_handler(commands=["bozza"])
-def cmd_bozza(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Scrivi il brief dopo /bozza")
-        return
-    phase = get_phase(m.chat.id)
-    sys_it = ("Sei l’editor ufficiale di 2Peak. Tono: criptico, selettivo, anti-hype. "
-              "Frasi brevi, pause. Non spiegare mai il 'secondo picco'.")
-    sys_en = ("You are 2Peak’s in-house editor. Tone: cryptic, selective, anti-hype. "
-              "Short lines. Never explain the 'second peak'.")
-    system = sys_it if phase == "IT" else sys_en
-    out = chat_gpt_brief(system, args[1].strip())
-    bot.reply_to(m, out[:4000])
 
-# ====== MEDIA MANAGEMENT ======
-@bot.message_handler(commands=["gifadd"])
-def cmd_gifadd(m: telebot.types.Message):
-    """
-    FILEID mode: rispondi a una GIF/Video/Foto con /gifadd <chiave>
-    Riconosce: animation, video, photo, document immagine
-    """
-    phase = get_phase(m.chat.id)
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Usa: rispondi a una GIF/Video/Foto con /gifadd <chiave>")
+@bot.message_handler(commands=['ricorda'])
+def cmd_ricorda(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usa: /ricorda <testo>")
         return
-    if not m.reply_to_message:
-        bot.reply_to(m, "Devi <b>rispondere</b> a un media con questo comando.")
-        return
-    key = args[1].strip().lower()
-
-    reply = m.reply_to_message
-    file_id = None
-    media_kind = None
-    if reply.animation:
-        file_id = reply.animation.file_id
-        media_kind = "animation"
-    elif reply.video:
-        file_id = reply.video.file_id
-        media_kind = "video"
-    elif reply.photo:
-        p = sorted(reply.photo, key=lambda x: x.file_size or 0)[-1]
-        file_id = p.file_id
-        media_kind = "photo"
-    elif reply.document:
-        mt = (reply.document.mime_type or "").lower()
-        file_id = reply.document.file_id
-        media_kind = "photo" if mt.startswith("image/") else "document"
-    else:
-        bot.reply_to(m, "Messaggio non valido: rispondi a GIF/Video/Foto/Documento immagine.")
+    text = parts[1].strip()
+    if not pinecone_ready():
+        bot.reply_to(message, "Memoria disabilitata (Pinecone non configurato).")
         return
 
     try:
-        p_upsert_fileid(phase, key, file_id, media_kind)
-        bot.reply_to(m, f"✅ Registrato asset ({media_kind}) per <b>{key}</b> (fase {phase}).")
+        vec = embed_text(text)
+        ns = str(message.chat.id)
+        vid = f"{int(time.time())}-{uuid4().hex[:6]}"
+        index.upsert(
+            vectors=[{"id": vid, "values": vec, "metadata": {"text": text}}],
+            namespace=ns
+        )
+        bot.reply_to(message, "Memorizzato ✅")
     except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore registrazione asset: {e}")
+        bot.reply_to(message, f"Errore memorizzazione: {e}")
 
-@bot.message_handler(commands=["gifaddurl"])
-def cmd_gifaddurl(m: telebot.types.Message):
-    """R2 mode: /gifaddurl <chiave> <url|path>  — auto-detect immagine/animazione/video da estensione."""
-    phase = get_phase(m.chat.id)
-    args = m.text.split(maxsplit=2)
-    if len(args) < 3 or not args[1].strip() or not args[2].strip():
-        bot.reply_to(m, "Usa: /gifaddurl <chiave> <url|path>")
+
+@bot.message_handler(commands=['cerca'])
+def cmd_cerca(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usa: /cerca <query>")
         return
-    key = args[1].strip().lower()
-    raw = args[2].strip()
-    url = raw if raw.lower().startswith("http") else (R2_PUBLIC_BASEURL + raw.lstrip("/"))
-
-    ul = url.lower()
-    if ul.endswith((".png",".jpg",".jpeg",".webp")):
-        media_kind = "image"
-    elif ul.endswith((".mp4",".mov",".webm",".mkv")):
-        media_kind = "video"
-    else:
-        media_kind = "animation"  # gif o altro
+    query = parts[1].strip()
+    if not pinecone_ready():
+        bot.reply_to(message, "Ricerca disabilitata (Pinecone non configurato).")
+        return
 
     try:
-        p_upsert_url(phase, key, url, media_kind)
-        bot.reply_to(m, f"✅ Registrato URL ({media_kind}) per <b>{key}</b> (fase {phase}).")
-    except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore registrazione URL: {e}")
-
-@bot.message_handler(commands=["gif"])
-def cmd_gif(m: telebot.types.Message):
-    """
-    /gif               → invia lo slot timeline corrente (fase IT/EN)
-    /gif <chiave>      → invia gli asset registrati per quella chiave (fase corrente)
-    """
-    phase = get_phase(m.chat.id)
-    args = m.text.split(maxsplit=1)
-    key = None
-    if len(args) == 1:
-        key = current_slot(phase)
-        if not key:
-            bot.reply_to(m, f"Nessuno slot timeline attivo oggi per fase {phase}.")
+        qv = embed_text(query)
+        ns = str(message.chat.id)
+        res = index.query(vector=qv, namespace=ns, top_k=3, include_values=False, include_metadata=True)
+        out = []
+        above = False
+        for m in res["matches"]:
+            score = m["score"]
+            txt = (m.get("metadata") or {}).get("text", "")
+            out.append(f"• {txt}\n(score: {round(score, 3)})")
+            if score >= SCORE_MIN:
+                above = True
+        if not out:
+            bot.reply_to(message, "Nessun risultato.")
             return
-    else:
-        key = args[1].strip().lower()
-    assets = p_get_assets(phase, key)
-    if not _send_assets(m.chat.id, assets, caption=f"{key} · fase {phase}"):
-        hint = f"Usa /gifadd {key} (rispondendo a un media) o /gifaddurl {key} <url|path>"
-        bot.reply_to(m, f"Nessun asset disponibile per «{key}» (fase {phase}). {hint}")
-
-@bot.message_handler(commands=["glitch"])
-def cmd_glitch(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Testo mancante. Usa: /glitch <testo>")
-        return
-    prompt = args[1].strip()
-    bot.send_chat_action(m.chat.id, "upload_document")
-    try:
-        gif_bytes = gen_glitch_gif_local(prompt, size=512, frames=12, fps=10)
-        bio = io.BytesIO(gif_bytes); bio.name = "glitch.gif"; bio.seek(0)
-        bot.send_animation(m.chat.id, bio, caption="Glitch pronto.")
+        if not above:
+            out.append("\n_(no match ≥ threshold; showing best available)_")
+        bot.reply_to(message, "\n\n".join(out))
     except Exception as e:
-        bot.reply_to(m, f"⚠️ Errore glitch: {e}")
+        bot.reply_to(message, f"Errore ricerca: {e}")
 
-# ======= TEST & BATCH =======
-def _send_key(chat_id: int, key: str) -> bool:
-    phase = get_phase(chat_id)
-    assets = p_get_assets(phase, key)
-    return _send_assets(chat_id, assets, caption=f"{key} · fase {phase}")
 
-@bot.message_handler(commands=["test_it"])
-def cmd_test_it(m: telebot.types.Message):
-    PHASE[m.chat.id] = "IT"
-    keys = ["manifesto", "oltre_la_soglia", "onda"]
-    missing = []
-    for k in keys:
-        bot.send_chat_action(m.chat.id, "upload_photo")
-        ok = _send_key(m.chat.id, k)
-        if not ok:
-            missing.append(k)
-        time.sleep(0.4)
-    if missing:
-        bot.reply_to(m, "⚠️ Mancano asset per: " + ", ".join(missing))
-    else:
-        bot.reply_to(m, "✅ Test IT completato.")
-
-@bot.message_handler(commands=["test_en"])
-def cmd_test_en(m: telebot.types.Message):
-    PHASE[m.chat.id] = "EN"
-    key = "beyond_the_threshold"
-    bot.send_chat_action(m.chat.id, "upload_photo")
-    ok = _send_key(m.chat.id, key)
-    if not ok:
-        bot.reply_to(m, f"⚠️ Nessun asset per «{key}».")
-    else:
-        bot.reply_to(m, "✅ Test EN completato.")
-
-@bot.message_handler(commands=["batch"])
-def cmd_batch(m: telebot.types.Message):
-    """
-    Esegue più azioni in un solo messaggio.
-    Sintassi: /batch <righe o ; separate>
-    Azioni supportate:
-      - fase it|en
-      - gif <chiave>
-      - gif          (usa slot timeline corrente)
-    """
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        bot.reply_to(m, "Usa /batch con azioni separate da ; o nuove linee.\nEsempio:\n/batch\nfase it; gif manifesto; gif oltre_la_soglia; gif onda")
+@bot.message_handler(commands=['svuota'])
+def cmd_svuota(message: types.Message):
+    if not pinecone_ready():
+        bot.reply_to(message, "Pinecone non configurato.")
         return
+    try:
+        ns = str(message.chat.id)
+        index.delete(namespace=ns, delete_all=True)
+        bot.reply_to(message, "Memoria di questa chat svuotata ✅")
+    except Exception as e:
+        bot.reply_to(message, f"Errore svuota: {e}")
 
-    script = args[1].strip()
-    parts = [p.strip() for p in re.split(r"[;\n]+", script) if p.strip()]
-    results = []
-    for p in parts:
-        pl = p.lower()
-        # fase
-        if pl.startswith("fase "):
-            val = pl.split(maxsplit=1)[1].strip().upper()
-            if val in ("IT","EN"):
-                PHASE[m.chat.id] = val
-                results.append(f"fase→{val}")
-            else:
-                results.append(f"fase⚠️({val})")
-        # gif <key>
-        elif pl.startswith("gif "):
-            key = p.split(maxsplit=1)[1].strip()
-            ok = _send_key(m.chat.id, key)
-            results.append(f"gif {key}→{'ok' if ok else 'manca'}")
-            time.sleep(0.3)
-        # gif (slot timeline)
-        elif pl == "gif":
-            phase = get_phase(m.chat.id)
-            key = current_slot(phase)
-            if not key:
-                results.append("gif(slot)⚠️ nessuno slot attivo")
-            else:
-                ok = _send_key(m.chat.id, key)
-                results.append(f"gif(slot:{key})→{'ok' if ok else 'manca'}")
-                time.sleep(0.3)
-        else:
-            results.append(f"ignora: {p}")
 
-    bot.reply_to(m, "Batch:\n" + " · ".join(results))
+# ------------- Post: GIF + caption in un unico messaggio -------------
+CAPTIONS_IT = {
+    "manifesto": "Il secondo picco non si spiega. Si scala.",
+    "oltre": "Oltre la soglia.",
+    "onda": "Porta l’onda più in alto."
+}
+CAPTIONS_EN = {
+    "manifesto": "The second peak can’t be explained. You climb it.",
+    "oltre": "Beyond the threshold.",
+    "onda": "Push the wave higher."
+}
 
-# ======= STEP 2B: POST + CAPTION + KEYS =======
-def _gen_caption_auto(phase: str, key: str) -> str:
-    sys_it = ("Sei l’editor ufficiale di 2Peak. Tono: criptico, selettivo, anti-hype. "
-              "Frasi brevi, pause. Non spiegare mai il 'secondo picco'. Usa hashtag minimi.")
-    sys_en = ("You are 2Peak’s in-house editor. Tone: cryptic, selective, anti-hype. "
-              "Short lines. Never explain the 'second peak'. Minimal hashtags.")
-    system = sys_it if phase == "IT" else sys_en
-    up = f"Scrivi una caption breve per la chiave «{key}». Niente spiegoni. 1–2 righe massimo."
-    if phase == "EN":
-        up = f"Write a short caption for key «{key}». No explanations. Max 1–2 lines."
-    out = chat_gpt_brief(system, up)
-    return (out or "").strip()
+# mappe GIF
+GIFS = {
+    "manifesto": GIF_MANIFESTO_URL,
+    "oltre": GIF_OLTRE_URL,
+    "onda": GIF_ONDA_URL
+}
+GLITCHES = {
+    "manifesto": GLITCH_MANIFESTO_URL,
+    "oltre": GLITCH_OLTRE_URL,
+    "onda": GLITCH_ONDA_URL
+}
 
-def _post_with_caption(chat_id: int, key: str):
-    phase = get_phase(chat_id)
-    cap = get_caption(phase, key)
-    if not cap:
-        cap = _gen_caption_auto(phase, key)
-    assets = p_get_assets(phase, key)
-    ok = _send_assets(chat_id, assets, caption=cap)
-    if not ok:
-        bot.send_message(chat_id, f"⚠️ Nessun asset per «{key}» (fase {phase}). Registra con /gifadd o /gifaddurl.")
-    else:
-        bot.send_message(chat_id, f"✅ Post «{key}» inviato (fase {phase}).")
 
-@bot.message_handler(commands=["post"])
-def cmd_post(m: telebot.types.Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) == 1 or not args[1].strip():
-        k = current_slot(get_phase(m.chat.id))
-        if not k:
-            bot.reply_to(m, "Nessuno slot attivo oggi. Usa: /post <chiave>")
-            return
-        _post_with_caption(m.chat.id, k)
+def caption_for(key: str, fase: str) -> str:
+    return (CAPTIONS_EN if fase.upper() == "EN" else CAPTIONS_IT).get(key, "")
+
+
+@bot.message_handler(commands=['post'])
+def cmd_post(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usa: /post <manifesto|oltre|onda>")
         return
-    key = args[1].strip().lower()
-    _post_with_caption(m.chat.id, key)
-
-@bot.message_handler(commands=["caption"])
-def cmd_caption(m: telebot.types.Message):
-    args = m.text.split(maxsplit=2)
-    if len(args) < 3 or not args[1].strip() or not args[2].strip():
-        bot.reply_to(m, "Usa: /caption <chiave> <testo>")
+    key = parts[1].strip().lower()
+    url = GIFS.get(key)
+    if not url:
+        bot.reply_to(message, "Chiave non valida. Usa: manifesto, oltre, onda.")
         return
-    key = args[1].strip().lower()
-    txt = args[2].strip()
-    set_caption(get_phase(m.chat.id), key, txt)
-    bot.reply_to(m, f"✅ Caption salvata per «{key}» (fase {get_phase(m.chat.id)}).")
+    fase = get_fase(message.chat.id)
+    try:
+        send_gif_with_caption(message.chat.id, url, caption_for(key, fase))
+        bot.reply_to(message, f"✅ Post «{key}» inviato (fase {fase}).")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore invio GIF: {e}")
 
-@bot.message_handler(commands=["keys"])
-def cmd_keys(m: telebot.types.Message):
-    keys = p_list_keys(get_phase(m.chat.id))
-    if not keys:
-        bot.reply_to(m, "Nessuna chiave asset registrata per questa fase.")
+
+# Compatibilità: /gif e /glitch (usano le stesse mappe)
+@bot.message_handler(commands=['gif'])
+def cmd_gif(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usa: /gif <manifesto|oltre|onda>")
         return
-    bot.reply_to(m, "Keys disponibili:\n" + "\n".join(f"• {k}" for k in keys))
+    key = parts[1].strip().lower()
+    url = GIFS.get(key)
+    if not url:
+        bot.reply_to(message, "Chiave non valida. Usa: manifesto, oltre, onda.")
+        return
+    fase = get_fase(message.chat.id)
+    try:
+        send_gif_with_caption(message.chat.id, url, caption_for(key, fase))
+        bot.reply_to(message, f"✅ GIF «{key}» inviata (fase {fase}).")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore invio GIF: {e}")
 
-# ================= HEALTH =================
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
 
-# ================= RUN (LOCAL) =================
+@bot.message_handler(commands=['glitch'])
+def cmd_glitch(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usa: /glitch <manifesto|oltre|onda>")
+        return
+    key = parts[1].strip().lower()
+    url = GLITCHES.get(key)
+    if not url:
+        bot.reply_to(message, "Chiave non valida. Usa: manifesto, oltre, onda.")
+        return
+    fase = get_fase(message.chat.id)
+    try:
+        send_gif_with_caption(message.chat.id, url, caption_for(key, fase))
+        bot.reply_to(message, f"✅ Glitch «{key}» inviato (fase {fase}).")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore invio glitch: {e}")
+
+
+# ------------- Scheduler giornaliero (/schedule, /unschedule) -------------
+def scheduled_post(chat_id: int, key: str, fase: str):
+    url = GIFS.get(key)
+    if not url:
+        bot.send_message(chat_id, f"⚠️ schedule: chiave non valida ({key})")
+        return
+    try:
+        send_gif_with_caption(chat_id, url, caption_for(key, fase))
+        bot.send_message(chat_id, f"🗓️ Post schedulato «{key}» inviato ({fase}).")
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Errore schedule: {e}")
+
+
+@bot.message_handler(commands=['schedule'])
+def cmd_schedule(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usa: /schedule <HH:MM> <manifesto|oltre|onda>")
+        return
+    hhmm, key = parts[1], parts[2].lower()
+    try:
+        hh, mm = map(int, hhmm.split(":"))
+        chat_id = message.chat.id
+
+        # rimuovi job precedente, se presente
+        if chat_id in scheduled_jobs:
+            try:
+                scheduler.remove_job(scheduled_jobs[chat_id])
+            except Exception:
+                pass
+
+        fase = get_fase(chat_id)
+        job = scheduler.add_job(
+            scheduled_post,
+            'cron',
+            hour=hh, minute=mm,
+            args=[chat_id, key, fase],
+            id=f"job_{chat_id}"
+        )
+        scheduled_jobs[chat_id] = job.id
+        bot.reply_to(message, f"🗓️ Schedulato ogni giorno {hhmm} → «{key}» (fase {fase}, TZ {TZ_NAME}).")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore schedule: {e}")
+
+
+@bot.message_handler(commands=['unschedule'])
+def cmd_unschedule(message: types.Message):
+    chat_id = message.chat.id
+    if chat_id not in scheduled_jobs:
+        bot.reply_to(message, "Nessuna schedulazione attiva.")
+        return
+    try:
+        scheduler.remove_job(scheduled_jobs[chat_id])
+        del scheduled_jobs[chat_id]
+        bot.reply_to(message, "🗑️ Schedulazione rimossa.")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore unschedule: {e}")
+
+
+# ------------- Pin dell’ultimo post -------------
+@bot.message_handler(commands=['pinlast'])
+def cmd_pinlast(message: types.Message):
+    chat_id = message.chat.id
+    msg_id = last_sent.get(chat_id)
+    if not msg_id:
+        bot.reply_to(message, "Non ho un ultimo post da fissare in questa chat.")
+        return
+    try:
+        bot.pin_chat_message(chat_id, msg_id, disable_notification=True)
+        bot.reply_to(message, "📌 Post fissato in alto.")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Errore pin: {e}\nAssicurati che il bot sia admin se è canale/gruppo.")
+
+
+# ------------- Webhook Flask -------------
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot 2Peak attivo 🚀"
+
+@app.route(f"/{TOKEN}", methods=["POST"])
+def receive_update():
+    try:
+        json_str = request.stream.read().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception as e:
+        logging.exception(e)
+    return "OK", 200
+
+
+def set_webhook_if_needed():
+    if not AUTO_SET_WEBHOOK or not WEBHOOK_BASE:
+        return
+    url = f"{WEBHOOK_BASE.rstrip('/')}/{TOKEN}"
+    try:
+        r = bot.set_webhook(url=url, drop_pending_updates=True)
+        logging.info(f"Webhook set: {r} → {url}")
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+
+
+# ------------- Avvio -------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    set_webhook_if_needed()
+    # avvio server Flask (Render lo esegue con gunicorn in produzione)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
