@@ -12,13 +12,13 @@ from openai import OpenAI
 from pinecone import Pinecone
 
 # =========================
-# ENV & CLIENTS
+# ENV VARS (Render)
 # =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
-PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es. https://<index-id>.svc.<region>.pinecone.io
+PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es: https://<index-id>.svc.<region>.pinecone.io
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN mancante")
@@ -27,18 +27,20 @@ if not OPENAI_API_KEY:
 if not PINECONE_API_KEY or not PINECONE_HOST:
     raise ValueError("PINECONE_API_KEY o PINECONE_HOST mancanti")
 
-# soglia di match per /cerca (modificabile da ENV senza toccare il codice)
-SCORE_MIN = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))
-# modello embedding (dimensione 1536 per la tua index)
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+# Config extra
+SCORE_MIN   = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))          # soglia /cerca
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")    # 1536 dim
 
+# =========================
+# CLIENTS
+# =========================
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 oai = OpenAI(api_key=OPENAI_API_KEY)
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(host=PINECONE_HOST)   # v5: ci si connette tramite host
+pc  = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(host=PINECONE_HOST)   # SDK v5: connessione via host
 
-# memoria “fase” per chat (IT/EN)
+# Memoria “fase” per chat (IT/EN)
 PHASE = {}  # {chat_id: "IT"|"EN"}
 
 
@@ -46,11 +48,9 @@ PHASE = {}  # {chat_id: "IT"|"EN"}
 # HELPER
 # =========================
 def _ns(message):
-    """Namespace = id chat (string) per isolare i dati di ogni chat."""
     return str(message.chat.id)
 
 def embed_text(text: str) -> list:
-    """Restituisce il vettore embedding (list[float])."""
     resp = oai.embeddings.create(model=EMBED_MODEL, input=text)
     return resp.data[0].embedding
 
@@ -62,16 +62,11 @@ def friendly_image_error(e: Exception) -> str:
     return f"⚠️ Errore generazione immagine: {s}"
 
 def gen_image_png(prompt: str) -> bytes:
-    """Genera PNG (bytes) con gpt-image-1; solleva eccezione in caso d’errore."""
     result = oai.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
     b64 = result.data[0].b64_json
     return base64.b64decode(b64)
 
 def gen_glitch_gif(prompt: str, frames: int = 6, dur_ms: int = 140) -> bytes:
-    """
-    Crea una GIF animata 'glitch' generando più frame e unendoli.
-    Se qualcosa va storto, solleva eccezione.
-    """
     imgs_np = []
     for i in range(frames):
         p = f"{prompt}. Glitch, chromatic aberration, scanlines, noise, frame {i+1}/{frames}"
@@ -79,44 +74,33 @@ def gen_glitch_gif(prompt: str, frames: int = 6, dur_ms: int = 140) -> bytes:
         b = base64.b64decode(r.data[0].b64_json)
         img = Image.open(io.BytesIO(b)).convert("RGB")
         imgs_np.append(np.array(img))
-
     out = io.BytesIO()
     iio.imwrite(out, imgs_np, extension=".gif", fps=int(1000/dur_ms))
     out.seek(0)
     return out.read()
 
 def pinecone_upsert(namespace: str, text: str):
-    """Memorizza un testo in Pinecone con metadata {text}."""
     vec = embed_text(text)
-    vector_id = str(uuid.uuid4())
-    index.upsert(
-        vectors=[{"id": vector_id, "values": vec, "metadata": {"text": text}}],
-        namespace=namespace,
-    )
+    index.upsert(vectors=[{"id": str(uuid.uuid4()), "values": vec, "metadata": {"text": text}}],
+                 namespace=namespace)
 
 def pinecone_query(namespace: str, query: str, top_k: int = 3):
-    """Cerca in Pinecone, ritorna lista di (text, score)."""
     vec = embed_text(query)
-    res = index.query(namespace=namespace, vector=vec, top_k=top_k, include_values=False, include_metadata=True)
+    res = index.query(namespace=namespace, vector=vec, top_k=top_k,
+                      include_values=False, include_metadata=True)
     items = []
     for m in res.get("matches", []):
         items.append((m["metadata"].get("text", ""), float(m.get("score", 0.0))))
     return items
 
 def rag_text(namespace: str, user_prompt: str, phase: str) -> str:
-    """Crea testo con contesto recuperato da Pinecone (RAG)."""
     results = pinecone_query(namespace, user_prompt, top_k=5)
     context = "\n".join([f"- {t}" for t, _ in results]) if results else "(nessun contesto memorizzato)"
-    sys_it = (
-        "Sei un copywriter del progetto 2Peak. Tono minimal, ascetico, "
-        "potente. Frasi brevi. Evita cliché. Integra il contesto se utile."
-    )
-    sys_en = (
-        "You are a 2Peak copywriter. Minimal, ascetic, powerful tone. "
-        "Short lines. Avoid clichés. Weave in context when useful."
-    )
+    sys_it = ("Sei un copywriter del progetto 2Peak. Tono minimal, ascetico, potente. "
+              "Frasi brevi. Evita cliché. Integra il contesto se utile.")
+    sys_en = ("You are a 2Peak copywriter. Minimal, ascetic, powerful tone. "
+              "Short lines. Avoid clichés. Weave in context when useful.")
     system = sys_it if phase == "IT" else sys_en
-
     msg = oai.responses.create(
         model=OPENAI_MODEL,
         input=[
@@ -128,21 +112,25 @@ def rag_text(namespace: str, user_prompt: str, phase: str) -> str:
 
 
 # =========================
-# WEBHOOK (Opzione A auto-set)
+# WEBHOOK (Auto-set con HTTPS)
 # =========================
 @app.route("/", methods=["GET"])
 def home():
     """
-    Auto-set del webhook:
-    visita l’URL del servizio (Render) → il bot resetta e setta il webhook a /<TOKEN>.
+    Visita questa pagina per impostare/aggiornare il webhook.
+    Forziamo https perché Telegram accetta solo HTTPS.
     """
-    base = request.url_root
+    base = request.url_root or ""
     if not base.endswith("/"):
         base += "/"
-    bot.remove_webhook()
-    bot.set_webhook(url=base + TELEGRAM_BOT_TOKEN)
-    return "Webhook set! 2Peak Bot attivo 🚀", 200
-
+    base = base.replace("http://", "https://")  # forza HTTPS su Render
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
+    webhook_url = base + TELEGRAM_BOT_TOKEN
+    bot.set_webhook(url=webhook_url)
+    return f"Webhook set → {webhook_url}", 200
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
@@ -226,10 +214,8 @@ def cmd_cerca(message):
         bot.reply_to(message, "Nessun risultato.")
         return
 
-    # filtra per soglia, ma se nessuno supera la soglia mostra il migliore (comportamento visto prima)
     above = [(t, s) for t, s in results if s >= SCORE_MIN]
     show = above if above else results[:1]
-
     lines = [f"• {t}\n(score: {s:.3f})" for t, s in show]
     if not above:
         lines.append("\n_(no match ≥ threshold; showing best available)_")
@@ -253,8 +239,7 @@ def cmd_bozza(message):
     phase = PHASE.get(_ns(message), "IT")
     try:
         out = rag_text(_ns(message), brief, phase)
-        # Telegram accetta max ~4096 char
-        bot.reply_to(message, out[:4000])
+        bot.reply_to(message, out[:4000])  # Telegram ~4096 char
     except Exception as e:
         bot.reply_to(message, f"⚠️ Errore bozza: {e}")
 
@@ -293,6 +278,4 @@ def cmd_glitch(message):
 # AVVIO LOCALE
 # =========================
 if __name__ == "__main__":
-    # In locale: python main.py
-    # In produzione (Render): start command → gunicorn main:app
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
