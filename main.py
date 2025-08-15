@@ -1,23 +1,24 @@
 # ==============================
-#  2Peak AI Bot — FULL PROVIDERS (Opzione C)
-#  Flask + TeleBot, OpenAI, Pinecone v5
-#  Media: R2 (URL) + FILEID Telegram, con auto-detection tipo
+#  2Peak / 2Pick AI Bot — FULL STACK (Opzione C)
+#  Flask + TeleBot, OpenAI (chat/embeddings), Pinecone v5
+#  Media: R2 (URL) + Telegram FILEID, glitch locale, menu bottoni, test & batch
 # ==============================
 
 import os
 import io
+import re
 import uuid
 import time
 import base64
 import logging
 from datetime import date
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
-from PIL import Image
-import imageio.v3 as iio
+from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, request, abort
 import telebot
+from telebot import types as t
 from openai import OpenAI
 from pinecone import Pinecone
 
@@ -28,11 +29,11 @@ OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
 PINECONE_HOST      = os.getenv("PINECONE_HOST")  # es: https://<index-id>.svc.<region>.pinecone.io
 SEARCH_SCORE_MIN   = float(os.getenv("SEARCH_SCORE_MIN", "0.60"))
-EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dim
+EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536-d
 
-# Provider media (mix): R2 preferito se settato, altrimenti FILEID
+# Provider media (mix). Se R2 è configurato, preferisce URL; altrimenti FILEID
 MEDIA_PROVIDER     = (os.getenv("MEDIA_PROVIDER", "FILEID") or "FILEID").upper()
-R2_PUBLIC_BASEURL  = os.getenv("R2_PUBLIC_BASEURL", "").rstrip("/")
+R2_PUBLIC_BASEURL  = (os.getenv("R2_PUBLIC_BASEURL", "") or "").rstrip("/")
 if R2_PUBLIC_BASEURL:
     R2_PUBLIC_BASEURL += "/"
 
@@ -45,7 +46,7 @@ if not PINECONE_API_KEY or not PINECONE_HOST:
 
 # ========= LOG =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("2peak")
+log = logging.getLogger("2peak_bot")
 
 # ========= CLIENTS =========
 app = Flask(__name__)
@@ -54,7 +55,7 @@ oai = OpenAI(api_key=OPENAI_API_KEY)
 pc  = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host=PINECONE_HOST)   # SDK v5 via host
 
-# ========= STATO LINGUA (per-chat) =========
+# ========= STATO LINGUA (per chat) =========
 PHASE: Dict[int, str] = {}  # {chat_id: "IT"/"EN"}
 def get_phase(chat_id: int) -> str:
     return PHASE.get(chat_id, "IT")
@@ -75,8 +76,8 @@ TIMELINE = {
 def today_iso() -> str:
     return date.today().isoformat()
 def current_slot(phase: str) -> str | None:
-    phase = (phase or "IT").upper()
-    for win in TIMELINE.get(phase, []):
+    ph = (phase or "IT").upper()
+    for win in TIMELINE.get(ph, []):
         if win["from"] <= today_iso() <= win["to"]:
             return win["slot"]
     return None
@@ -85,18 +86,6 @@ def current_slot(phase: str) -> str | None:
 def embed_text(text: str) -> List[float]:
     r = oai.embeddings.create(model=EMBED_MODEL, input=text)
     return r.data[0].embedding
-
-def gen_image_png(prompt: str, size: str = "1024x1024") -> bytes:
-    # size valide: "1024x1024", "1024x1536", "1536x1024", "auto"
-    try:
-        r = oai.images.generate(model="gpt-image-1", prompt=prompt, size=size)
-        b64 = r.data[0].b64_json
-        return base64.b64decode(b64)
-    except Exception as e:
-        s = str(e).lower()
-        if "verify" in s or "organization must be verified" in s:
-            raise RuntimeError("⚠️ Immagini bloccate: verifica l’organizzazione OpenAI per gpt-image-1.")
-        raise
 
 def chat_gpt_brief(system: str, user_prompt: str) -> str:
     try:
@@ -120,7 +109,7 @@ def p_upsert(ns: str, vec: List[float], metadata: Dict):
 def p_upsert_text(ns: str, text: str):
     p_upsert(ns, embed_text(text), {"type": "note", "text": text})
 
-def p_query_text(ns: str, query: str, top_k: int = 3) -> List[tuple[str, float]]:
+def p_query_text(ns: str, query: str, top_k: int = 3) -> List[Tuple[str,float]]:
     res = index.query(namespace=ns, vector=embed_text(query), top_k=top_k, include_metadata=True)
     out = []
     for m in res.get("matches", []):
@@ -133,11 +122,13 @@ def p_query_text(ns: str, query: str, top_k: int = 3) -> List[tuple[str, float]]
 # FILEID: metadata {type:"asset_fileid", phase, key, file_id, media_kind}
 # URL:    metadata {type:"asset_url",    phase, key, url,      media_kind}
 def p_upsert_fileid(phase: str, key: str, file_id: str, media_kind: str):
-    p_upsert("assets", embed_text(f"asset {phase} {key} {media_kind} fileid"), 
+    p_upsert("assets",
+             embed_text(f"asset {phase} {key} {media_kind} fileid"),
              {"type": "asset_fileid", "phase": phase, "key": key, "file_id": file_id, "media_kind": media_kind})
 
 def p_upsert_url(phase: str, key: str, url: str, media_kind: str):
-    p_upsert("assets", embed_text(f"asset {phase} {key} {media_kind} url"),
+    p_upsert("assets",
+             embed_text(f"asset {phase} {key} {media_kind} url"),
              {"type": "asset_url", "phase": phase, "key": key, "url": url, "media_kind": media_kind})
 
 def p_get_assets(phase: str, key: str) -> Dict[str, List[Dict]]:
@@ -158,22 +149,49 @@ def p_get_assets(phase: str, key: str) -> Dict[str, List[Dict]]:
             out["urls"].append({"url": md["url"], "media_kind": md.get("media_kind", "animation")})
     return out
 
-# ========= GLITCH (GIF animata generativa semplice) =========
-def gen_glitch_gif(prompt: str, frames: int = 6, dur_ms: int = 140) -> bytes:
-    imgs_np = []
-    for i in range(frames):
-        p = f"{prompt}. Glitch, chromatic aberration, scanlines, noise, frame {i+1}/{frames}"
-        b = gen_image_png(p, size="1024x1024")
-        img = Image.open(io.BytesIO(b)).convert("RGB")
-        # micro-glitch: shift righe
+# ========= GLITCH LOCALE (GIF animata, no servizi esterni) =========
+def gen_glitch_gif_local(text: str, size: int = 512, frames: int = 12, fps: int = 10) -> bytes:
+    W = H = size
+    INDIGO = (16,22,55); BLUE = (28,40,120); WHITE = (245,247,255)
+    def grad():
+        base = Image.new("RGB", (W,H), INDIGO)
+        top  = Image.new("RGB", (W,H), BLUE)
+        mask = Image.linear_gradient("L").resize((W,H))
+        return Image.composite(top, base, mask)
+    def shift_rgb(img, dx=2):
         arr = np.array(img)
-        if i % 2 == 0:
-            arr[::4] = np.roll(arr[::4], 10, axis=1)
-        imgs_np.append(arr)
-    out = io.BytesIO()
-    iio.imwrite(out, imgs_np, extension=".gif", fps=int(1000 / dur_ms))
-    out.seek(0)
-    return out.read()
+        r,g,b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
+        r = np.roll(r, dx, axis=1); b = np.roll(b, -dx, axis=1)
+        return Image.fromarray(np.stack([r,g,b], axis=2))
+    def scanlines(img, strength=28):
+        arr = np.array(img).astype(np.int16)
+        arr[::4,:,:] = np.clip(arr[::4,:,:] - strength, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
+    def center_text(img, txt, fill=WHITE, sz=28):
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sz)
+        except:
+            font = ImageFont.load_default()
+        bbox = d.textbbox((0,0), txt, font=font)
+        x = (img.width - (bbox[2]-bbox[0]))//2
+        y = (img.height - (bbox[3]-bbox[1]))//2
+        d.text((x,y), txt, font=font, fill=fill)
+        return img
+    frames_list = []
+    for i in range(frames):
+        bg = grad()
+        layer = center_text(bg.copy(), text, sz=28)
+        if i%3==0: layer = shift_rgb(layer, dx=3)
+        if i%4==0:
+            arr = np.array(layer)
+            arr[::8,:,:] = np.roll(arr[::8,:,:], 6, axis=1)
+            layer = Image.fromarray(arr)
+        frames_list.append(scanlines(layer, 26))
+    bio = io.BytesIO()
+    frames_list[0].save(bio, format="GIF", save_all=True, append_images=frames_list[1:], duration=int(1000/fps), loop=0, disposal=2)
+    bio.seek(0)
+    return bio.read()
 
 # ========= WEBHOOK (auto-set HTTPS) =========
 @app.route("/", methods=["GET"])
@@ -198,10 +216,10 @@ def telegram_webhook():
         return "OK", 200
     return abort(403)
 
-# ========= UTILS INVIO =========
-IMG_EXTS  = (".png", ".jpg", ".jpeg", ".webp")
+# ========= INVIO MEDIA =========
+IMG_EXTS  = (".png",".jpg",".jpeg",".webp")
 ANIM_EXTS = (".gif",)
-VID_EXTS  = (".mp4", ".mov", ".webm", ".mkv")
+VID_EXTS  = (".mp4",".mov",".webm",".mkv")
 
 def _send_url(chat_id: int, url: str, kind_hint: str = "", caption: str = "") -> bool:
     u = url.lower()
@@ -210,7 +228,7 @@ def _send_url(chat_id: int, url: str, kind_hint: str = "", caption: str = "") ->
             bot.send_photo(chat_id, url, caption=caption or None)
         elif kind_hint == "video" or u.endswith(VID_EXTS):
             bot.send_video(chat_id, url, caption=caption or None)
-        else:  # default animation (gif)
+        else:
             bot.send_animation(chat_id, url, caption=caption or None)
         return True
     except Exception as e:
@@ -241,21 +259,21 @@ def _send_fileid(chat_id: int, file_id: str, kind: str = "", caption: str = "") 
         return False
 
 def _send_assets(chat_id: int, assets: Dict[str, List[Dict]], caption: str = ""):
-    # Priorità provider
+    # Preferenza al provider configurato
     if MEDIA_PROVIDER == "R2" and assets["urls"]:
         sent = 0
         for a in assets["urls"][:3]:
             if _send_url(chat_id, a["url"], a.get("media_kind",""), caption if sent == 0 else ""):
                 sent += 1
         if sent: return True
-    # fallback a FILEID
+    # FILEID
     if assets["fileids"]:
         sent = 0
         for a in assets["fileids"][:3]:
             if _send_fileid(chat_id, a["file_id"], a.get("media_kind",""), caption if sent == 0 else ""):
                 sent += 1
         if sent: return True
-    # se niente, prova anche URL (se provider FILEID ma url registrati esistono)
+    # fallback URL anche se provider non è R2
     if MEDIA_PROVIDER != "R2" and assets["urls"]:
         sent = 0
         for a in assets["urls"][:3]:
@@ -264,16 +282,73 @@ def _send_assets(chat_id: int, assets: Dict[str, List[Dict]], caption: str = "")
         if sent: return True
     return False
 
-# ========= HANDLERS =========
+# ========= MENÙ BOTTONI =========
+def make_menu(chat_id: int) -> t.InlineKeyboardMarkup:
+    ph = get_phase(chat_id)
+    kb = t.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        t.InlineKeyboardButton("🇮🇹 Fase IT", callback_data="phase:IT"),
+        t.InlineKeyboardButton("🇬🇧 Fase EN", callback_data="phase:EN"),
+    )
+    kb.add(
+        t.InlineKeyboardButton("🎞 manifesto", callback_data="gif:manifesto"),
+        t.InlineKeyboardButton("⚡ oltre_la_soglia", callback_data="gif:oltre_la_soglia"),
+        t.InlineKeyboardButton("🌊 onda", callback_data="gif:onda"),
+    )
+    kb.add(
+        t.InlineKeyboardButton("🛰 beyond_the_threshold", callback_data="gif:beyond_the_threshold"),
+        t.InlineKeyboardButton("📶 glitch_signal", callback_data="gif:glitch_signal"),
+        t.InlineKeyboardButton("🎯 slot (oggi)", callback_data="gif:slot"),
+    )
+    return kb
+
+@bot.message_handler(commands=["menu"])
+def cmd_menu(m: telebot.types.Message):
+    kb = make_menu(m.chat.id)
+    bot.reply_to(m, f"Fase corrente: <b>{get_phase(m.chat.id)}</b>\nScegli un’azione:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(c: telebot.types.CallbackQuery):
+    try:
+        data = c.data or ""
+        chat_id = c.message.chat.id
+        if data.startswith("phase:"):
+            val = data.split(":",1)[1].upper()
+            if val in ("IT","EN"):
+                PHASE[chat_id] = val
+                bot.answer_callback_query(c.id, f"Fase → {val}")
+                bot.edit_message_text(f"Fase impostata: <b>{val}</b>", chat_id, c.message.message_id, parse_mode="HTML", reply_markup=make_menu(chat_id))
+            else:
+                bot.answer_callback_query(c.id, "Valore fase non valido.")
+        elif data.startswith("gif:"):
+            key = data.split(":",1)[1]
+            if key == "slot":
+                key = current_slot(get_phase(chat_id))
+                if not key:
+                    bot.answer_callback_query(c.id, "Nessuno slot attivo oggi.")
+                    return
+            assets = p_get_assets(get_phase(chat_id), key)
+            ok = _send_assets(chat_id, assets, caption=f"{key} · fase {get_phase(chat_id)}")
+            bot.answer_callback_query(c.id, "Inviato." if ok else "Nessun asset registrato.")
+        else:
+            bot.answer_callback_query(c.id, "Ignorato.")
+    except Exception as e:
+        log.error("callback ERROR: %r", e)
+        try:
+            bot.answer_callback_query(c.id, "Errore.")
+        except Exception:
+            pass
+
+# ========= HANDLERS BASE =========
 @bot.message_handler(commands=["start"])
 def cmd_start(m: telebot.types.Message):
     PHASE[m.chat.id] = PHASE.get(m.chat.id, "IT")
     bot.reply_to(
         m,
-        "👋 Benvenuto in 2Peak.\n"
+        "👋 Benvenuto in 2Peak/2Pick.\n"
         "Comandi: /fase it|en · /ricorda <testo> · /cerca <query> · /svuota ·\n"
-        "/bozza <brief> · /gif [chiave] · /gifadd <chiave> (rispondendo a GIF/Video/Foto) · /gifaddurl <chiave> <url> · /glitch <testo>\n"
-        "Il secondo picco non si spiega. Si scala."
+        "/bozza <brief> · /gif [chiave] · /gifadd (reply) · /gifaddurl <chiave> <url> · /glitch <testo>\n"
+        "/test_it · /test_en · /batch <azioni> · /menu"
     )
 
 @bot.message_handler(commands=["help"])
@@ -286,10 +361,13 @@ def cmd_help(m: telebot.types.Message):
         "/cerca <query> – cerca fra i ricordi\n"
         "/svuota – reset messaggi\n"
         "/bozza <brief> – bozza creativa 2Peak\n"
-        "/gif [chiave] – invia asset dello slot o della chiave\n"
+        "/gif [chiave] – invia asset registrati\n"
         "/gifadd <chiave> – rispondi a una GIF/Video/Foto per registrarla (FILEID)\n"
         "/gifaddurl <chiave> <url> – registra URL (R2 o altro)\n"
-        "/glitch <testo> – GIF glitch animata"
+        "/glitch <testo> – GIF glitch animata (locale)\n"
+        "/test_it · /test_en – test rapidi\n"
+        "/batch – esecuzione di più comandi con ; o nuove linee\n"
+        "/menu – bottoni rapidi"
     )
 
 @bot.message_handler(commands=["fase"])
@@ -305,7 +383,7 @@ def cmd_fase(m: telebot.types.Message):
     PHASE[m.chat.id] = val
     bot.reply_to(m, f"Fase impostata: <b>{val}</b>")
 
-@bot.message_handler(commands=["ricorda", "memorizza"])
+@bot.message_handler(commands=["ricorda","memorizza"])
 def cmd_ricorda(m: telebot.types.Message):
     args = m.text.split(maxsplit=1)
     if len(args) == 1 or not args[1].strip():
@@ -335,7 +413,7 @@ def cmd_cerca(m: telebot.types.Message):
     show  = above if above else results[:1]
     lines = [f"• {t}\n(score: {s:.3f})" for t,s in show]
     if not above:
-        lines.append("\n<i>(no match ≥ threshold; showing best available)</i>")
+        lines.append("\n<i>(no match ≥ soglia; mostro il migliore disponibile)</i>")
     bot.reply_to(m, "\n\n".join(lines))
 
 @bot.message_handler(commands=["svuota"])
@@ -384,7 +462,6 @@ def cmd_gifadd(m: telebot.types.Message):
         file_id = reply.video.file_id
         media_kind = "video"
     elif reply.photo:
-        # prendiamo la risoluzione più grande
         p = sorted(reply.photo, key=lambda x: x.file_size or 0)[-1]
         file_id = p.file_id
         media_kind = "photo"
@@ -433,13 +510,10 @@ def cmd_gif(m: telebot.types.Message):
     """
     /gif               → invia lo slot timeline corrente (fase IT/EN)
     /gif <chiave>      → invia gli asset registrati per quella chiave (fase corrente)
-    Auto‑detection:
-      - URL: .png/.jpg → photo, .gif → animation, .mp4/.mov → video
-      - FILEID: si usa il tipo salvato (photo/video/animation/document)
     """
     phase = get_phase(m.chat.id)
     args = m.text.split(maxsplit=1)
-
+    key = None
     if len(args) == 1:
         key = current_slot(phase)
         if not key:
@@ -447,7 +521,6 @@ def cmd_gif(m: telebot.types.Message):
             return
     else:
         key = args[1].strip().lower()
-
     assets = p_get_assets(phase, key)
     if not _send_assets(m.chat.id, assets, caption=f"{key} · fase {phase}"):
         hint = f"Usa /gifadd {key} (rispondendo a un media) o /gifaddurl {key} <url|path>"
@@ -462,20 +535,100 @@ def cmd_glitch(m: telebot.types.Message):
     prompt = args[1].strip()
     bot.send_chat_action(m.chat.id, "upload_document")
     try:
-        gif_bytes = gen_glitch_gif(prompt, frames=6, dur_ms=140)
+        gif_bytes = gen_glitch_gif_local(prompt, size=512, frames=12, fps=10)
         bio = io.BytesIO(gif_bytes); bio.name = "glitch.gif"; bio.seek(0)
         bot.send_animation(m.chat.id, bio, caption="Glitch pronto.")
-    except RuntimeError as e:
-        bot.reply_to(m, str(e))
     except Exception as e:
         bot.reply_to(m, f"⚠️ Errore glitch: {e}")
 
-# ================= RUN (LOCAL) =================
+# ======= TEST & BATCH =======
+def _send_key(chat_id: int, key: str) -> bool:
+    phase = get_phase(chat_id)
+    assets = p_get_assets(phase, key)
+    return _send_assets(chat_id, assets, caption=f"{key} · fase {phase}")
+
+@bot.message_handler(commands=["test_it"])
+def cmd_test_it(m: telebot.types.Message):
+    PHASE[m.chat.id] = "IT"
+    keys = ["manifesto", "oltre_la_soglia", "onda"]
+    missing = []
+    for k in keys:
+        bot.send_chat_action(m.chat.id, "upload_photo")
+        ok = _send_key(m.chat.id, k)
+        if not ok:
+            missing.append(k)
+        time.sleep(0.4)
+    if missing:
+        bot.reply_to(m, "⚠️ Mancano asset per: " + ", ".join(missing))
+    else:
+        bot.reply_to(m, "✅ Test IT completato.")
+
+@bot.message_handler(commands=["test_en"])
+def cmd_test_en(m: telebot.types.Message):
+    PHASE[m.chat.id] = "EN"
+    key = "beyond_the_threshold"
+    bot.send_chat_action(m.chat.id, "upload_photo")
+    ok = _send_key(m.chat.id, key)
+    if not ok:
+        bot.reply_to(m, f"⚠️ Nessun asset per «{key}».")
+    else:
+        bot.reply_to(m, "✅ Test EN completato.")
+
+@bot.message_handler(commands=["batch"])
+def cmd_batch(m: telebot.types.Message):
+    """
+    Esegue più azioni in un solo messaggio.
+    Sintassi: /batch <righe o ; separate>
+    Azioni supportate:
+      - fase it|en
+      - gif <chiave>
+      - gif          (usa slot timeline corrente)
+    """
+    args = m.text.split(maxsplit=1)
+    if len(args) == 1 or not args[1].strip():
+        bot.reply_to(m, "Usa /batch con azioni separate da ; o nuove linee.\nEsempio:\n/batch\nfase it; gif manifesto; gif oltre_la_soglia; gif onda")
+        return
+
+    script = args[1].strip()
+    parts = [p.strip() for p in re.split(r"[;\n]+", script) if p.strip()]
+    results = []
+    for p in parts:
+        pl = p.lower()
+        # fase
+        if pl.startswith("fase "):
+            val = pl.split(maxsplit=1)[1].strip().upper()
+            if val in ("IT","EN"):
+                PHASE[m.chat.id] = val
+                results.append(f"fase→{val}")
+            else:
+                results.append(f"fase⚠️({val})")
+        # gif <key>
+        elif pl.startswith("gif "):
+            key = p.split(maxsplit=1)[1].strip()
+            ok = _send_key(m.chat.id, key)
+            results.append(f"gif {key}→{'ok' if ok else 'manca'}")
+            time.sleep(0.3)
+        # gif (slot timeline)
+        elif pl == "gif":
+            phase = get_phase(m.chat.id)
+            key = current_slot(phase)
+            if not key:
+                results.append("gif(slot)⚠️ nessuno slot attivo")
+            else:
+                ok = _send_key(m.chat.id, key)
+                results.append(f"gif(slot:{key})→{'ok' if ok else 'manca'}")
+                time.sleep(0.3)
+        else:
+            results.append(f"ignora: {p}")
+
+    bot.reply_to(m, "Batch:\n" + " · ".join(results))
+
+# ================= HEALTH =================
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
+# ================= RUN (LOCAL) =================
 if __name__ == "__main__":
-    # Avvio Flask (Render usa gunicorn main:app)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
