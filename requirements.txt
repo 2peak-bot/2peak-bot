@@ -3,8 +3,6 @@ gunicorn>=21.2
 pyTelegramBotAPI==4.17.0
 openai>=1.40.0
 pinecone>=5.0.0
-APScheduler>=3.10
+supabase>=2.4.0
 pytz>=2024.1
-pillow>=10.3
-numpy>=1.26
 requests>=2.32
